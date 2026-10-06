@@ -1,0 +1,25 @@
+{
+  "name": "chattaker",
+  "version": "1.0.0",
+  "description": "Saves your ChatGPT and Gemini conversation history to your vault.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "check": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production && node scripts/selfcheck.mjs"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "@types/turndown": "^5.0.5",
+    "builtin-modules": "^5.0.0",
+    "esbuild": "0.25.5",
+    "obsidian": "latest",
+    "tslib": "2.8.1",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "turndown": "^7.2.0",
+    "turndown-plugin-gfm": "^1.0.2"
+  }
+}

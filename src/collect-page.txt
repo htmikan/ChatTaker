@@ -1,0 +1,1711 @@
+(function () {
+  if (window.__ctInstalled) {
+    if (location.hostname.indexOf('gemini.google') >= 0) installGemini();
+    else installChatGPT();
+    return 0;
+  }
+  window.__ctInstalled = true;
+
+  var mediaElements = new Map();
+  var mediaMeta = new Map();
+  var mediaSeq = 0;
+  var debugCitationRecords = [];
+
+  function debugCitationsEnabled() {
+    return Boolean(window.__ctDebugCitations);
+  }
+
+  function resetDebugCitations() {
+    debugCitationRecords = [];
+  }
+
+  function clipDebug(value, max) {
+    var text = String(value || '');
+    return text.length <= max ? text : text.slice(0, max) + '…';
+  }
+
+  function recordCitationDebug(node, output, outcome, extra) {
+    if (!debugCitationsEnabled() || debugCitationRecords.length >= 20) return;
+    var aria = '';
+    if (node && node.getAttribute) aria = node.getAttribute('aria-label') || '';
+    if (!aria && node && node.querySelector) {
+      var labeled = node.querySelector('[aria-label]');
+      if (labeled) aria = labeled.getAttribute('aria-label') || '';
+    }
+    var jslog = node && node.getAttribute ? (node.getAttribute('jslog') || '') : '';
+    if (!jslog && node) {
+      var withLog = queryAllDeep(node, '[jslog]')[0];
+      if (withLog) jslog = withLog.getAttribute('jslog') || '';
+    }
+    var hrefAttr = node && node.getAttribute ? (node.getAttribute('href') || '') : '';
+    var dataHref = node && node.getAttribute ? (node.getAttribute('data-href') || '') : '';
+    var dataUrl = node && node.getAttribute ? (node.getAttribute('data-url') || '') : '';
+    var noiseFiltered = (extra && extra.noiseFiltered) || [];
+    debugCitationRecords.push({
+      tag: String(node && node.tagName || ''),
+      className: classNameOf(node),
+      ariaLabel: clipDebug(aria, 200),
+      attrs: {
+        href: hrefAttr || undefined,
+        dataHref: dataHref || undefined,
+        dataUrl: dataUrl || undefined,
+        hasJslog: Boolean(jslog),
+        jslogPreview: jslog ? clipDebug(jslog, 300) : undefined,
+      },
+      resolvedHref: (extra && extra.resolvedHref) || '',
+      jslogUrls: (extra && extra.jslogUrls) || [],
+      noiseFiltered: noiseFiltered,
+      output: clipDebug(output, 300),
+      outcome: outcome || 'empty',
+      outerHtml: node && node.outerHTML ? clipDebug(node.outerHTML, 800) : undefined,
+    });
+  }
+
+  function buildPageDebugPayload(exported) {
+    if (!debugCitationsEnabled()) return undefined;
+    var html = '';
+    (exported.items || []).forEach(function (item) { html += item.html || ''; });
+    var anchors = (html.match(/<a\b/gi) || []).length;
+    var citeNames = (html.match(/data-ct-cite-name=/gi) || []).length;
+    return {
+      citations: debugCitationRecords.slice(),
+      summary: {
+        pageCitations: debugCitationRecords.length,
+        pageAnchors: anchors,
+        pageCiteNames: citeNames,
+        pageSources: (exported.sources || []).length,
+      },
+    };
+  }
+
+  function nextSession() {
+    var current = Number(sessionStorage.getItem('ct-session') || '0');
+    var next = current + 1;
+    sessionStorage.setItem('ct-session', String(next));
+    return next;
+  }
+
+  function delay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function queryAllDeep(root, selector) {
+    var found = [];
+    var seen = new Set();
+    function visit(node) {
+      if (!node || seen.has(node) || !node.querySelectorAll) return;
+      seen.add(node);
+      node.querySelectorAll(selector).forEach(function (el) { found.push(el); });
+      node.querySelectorAll('*').forEach(function (el) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      });
+    }
+    visit(root);
+    return found;
+  }
+
+  function allDocs() {
+    var docs = [document];
+    document.querySelectorAll('iframe').forEach(function (frame) {
+      try {
+        if (frame.contentDocument) docs.push(frame.contentDocument);
+      } catch (e) {}
+    });
+    return docs;
+  }
+
+  function outermost(nodes) {
+    return nodes.filter(function (el) {
+      return !nodes.some(function (other) { return other !== el && other.contains(el); });
+    });
+  }
+
+  function esc(value) {
+    return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function resolveHref(href) {
+    var value = String(href || '').trim();
+    if (!value || value === '#' || /^javascript:/i.test(value) || /^mailto:/i.test(value) || /^data:/i.test(value)) return '';
+    try {
+      if (!/^https?:\/\//i.test(value)) value = new URL(value, location.href).href;
+    } catch (e) {
+      return '';
+    }
+    if (!/^https?:\/\//i.test(value)) return '';
+    value = unwrapSourceUrl(value);
+    // Gemini のハイライト用フラグメントは同一 URL の重複脚注になるので落とす
+    value = value.replace(/#:~:.*$/, "");
+    return value.replace(/"/g, '%22');
+  }
+
+  function unwrapSourceUrl(url) {
+    try {
+      var u = new URL(url);
+      if (/google\./i.test(u.hostname) && (u.pathname === '/url' || u.pathname.indexOf('/url') === 0)) {
+        var q = u.searchParams.get('q') || u.searchParams.get('url') || u.searchParams.get('rurl');
+        if (q && /^https?:\/\//i.test(q)) return q;
+      }
+    } catch (e) {}
+    return url;
+  }
+
+  function resolveHrefFromNode(node) {
+    if (!node || !node.getAttribute) return '';
+    var attrs = [
+      'href', 'data-href', 'data-url', 'data-source-url', 'data-external-url', 'data-absolute-url',
+      'data-resource-url', 'data-redirect-url', 'cite', 'ng-href',
+    ];
+    for (var i = 0; i < attrs.length; i++) {
+      var resolved = resolveHref(node.getAttribute(attrs[i]));
+      if (resolved) return resolved;
+    }
+    return '';
+  }
+
+  function firstHttpUrl(text) {
+    var match = /https?:\/\/[^\s<>"']+/i.exec(String(text || ''));
+    if (!match) return '';
+    return resolveHref(match[0].replace(/[.,;:!?)]+$/g, ''));
+  }
+
+  // Gemini の出典チップは URL を <a> ではなく jslog 属性内の base64(BardVeMetadataKey)に持つ
+  function decodeJslogUrls(value) {
+    var urls = [];
+    var m = /BardVeMetadataKey:([A-Za-z0-9+/_=-]+)/.exec(String(value || ''));
+    if (!m) return urls;
+    try {
+      var b64 = m[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (b64.length % 4) b64 += '=';
+      var bin = atob(b64);
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      var text = new TextDecoder('utf-8').decode(bytes).replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+      (text.match(/https?:\/\/[^"\s\\]+/gi) || []).forEach(function (raw) {
+        var href = resolveHref(raw);
+        if (href && !isNoiseSourceUrl(href) && urls.indexOf(href) < 0) urls.push(href);
+      });
+    } catch (e) {}
+    return urls;
+  }
+
+  function jslogUrlsDeep(node) {
+    var urls = [];
+    if (!node || node.nodeType !== 1) return urls;
+    function take(el) {
+      decodeJslogUrls(el.getAttribute && el.getAttribute('jslog')).forEach(function (u) {
+        if (urls.indexOf(u) < 0) urls.push(u);
+      });
+    }
+    take(node);
+    queryAllDeep(node, '[jslog*="BardVeMetadataKey"]').forEach(take);
+    return urls;
+  }
+
+  function findHrefDeep(node) {
+    if (!node) return '';
+    var href = resolveHrefFromNode(node);
+    if (href && !isNoiseSourceUrl(href)) return href;
+    if (node.closest) {
+      var parent = node.closest('a');
+      if (parent) {
+        href = resolveHrefFromNode(parent);
+        if (href && !isNoiseSourceUrl(href)) return href;
+      }
+    }
+    var found = '';
+    queryAllDeep(node, 'a[href], [data-href], [data-url], [data-source-url], [data-external-url], [data-absolute-url]').some(function (el) {
+      found = resolveHrefFromNode(el);
+      return Boolean(found && !isNoiseSourceUrl(found));
+    });
+    if (found && !isNoiseSourceUrl(found)) return found;
+    var fromLog = jslogUrlsDeep(node);
+    if (fromLog.length) return fromLog[0];
+    var blob = [
+      node.getAttribute && node.getAttribute('aria-label'),
+      node.getAttribute && node.getAttribute('title'),
+      node.innerText,
+      node.textContent,
+    ].join(' ');
+    var fromText = firstHttpUrl(blob);
+    return fromText && !isNoiseSourceUrl(fromText) ? fromText : '';
+  }
+
+  function isCitationPill(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || '').toUpperCase();
+    if (tag === 'SOURCE-INLINE-CHIP' || tag === 'CITATION-CHIP' || tag === 'FOOTNOTE-CHIP') return true;
+    if (node.getAttribute) {
+      if (node.hasAttribute('data-assistant-sources-trigger') || node.hasAttribute('data-assistant-sources-payload')) return true;
+      if (node.hasAttribute('data-assistant-grouped-webpages') || node.hasAttribute('data-assistant-grouped-webpages-item')) return true;
+      if (node.getAttribute('data-content-reference-type') === 'grouped_webpages') return true;
+    }
+    var testId = String(node.getAttribute && node.getAttribute('data-testid') || '').toLowerCase();
+    if (testId.indexOf('citation') >= 0 || testId.indexOf('source-pill') >= 0 || testId.indexOf('footnote') >= 0) return true;
+    var cls = classNameOf(node).toLowerCase();
+    if (/webpage-citation|citation-pill|source-pill|source-inline-chip(?!-container)|cite-pill|reference-pill|group\/footnote|\/footnote/.test(cls)) return true;
+    var aria = String(node.getAttribute && node.getAttribute('aria-label') || '').toLowerCase();
+    if (/citation from|引用元|出典の詳細|ソースの詳細|view source|からの引用|出典を表示|view citation|情報源/.test(aria)) return true;
+    // ChatGPT の短縮表示（例: WWebull+1 / US EPA +1）— BUTTON 以外の span にも付く
+    if (looksLikeCiteChipText(node)) return true;
+    return false;
+  }
+
+  function looksLikeCiteChipText(node) {
+    var text = String(node.innerText || node.textContent || '')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text || text.length > 48) return false;
+    if (/^(https?:\/\/|www\.)/i.test(text)) return false;
+    if (/[=\/\\]/.test(text)) return false;
+    // 例: example.com / example.com+1 / WWebull+1 / US EPA +1 / 楽天市場+2
+    if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,30}\.[A-Za-z]{2,}(?:\s*[+＋]\d+)?$/.test(text)) return true;
+    if (/^[A-Za-z][A-Za-z0-9._-]{1,30}\s*[+＋]\d+$/.test(text)) return true;
+    if (/^[A-Za-z][A-Za-z0-9 ._-]{1,30}\s*[+＋]\d+$/.test(text)) return true;
+    if (/^[\u3040-\u30ff\u4e00-\u9fff\w][\u3040-\u30ff\u4e00-\u9fff\w ._-]{0,30}\s*[+＋]\d+$/.test(text)) return true;
+    return false;
+  }
+
+  // 検索結果カルーセル等は本文に混ぜると壊れる。参照一覧側で拾う。
+  function isSourcesChrome(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || '').toUpperCase();
+    if (
+      tag === 'SOURCES-CAROUSEL-INLINE' ||
+      tag === 'SOURCES-CAROUSEL' ||
+      tag === 'STRUCTURED-SOURCES-BLOCK' ||
+      tag === 'SOURCES-SIDEBAR' ||
+      tag === 'SIDEBAR-SOURCES' ||
+      tag === 'MODEL-THOUGHTS' ||
+      tag === 'THOUGHTS-ANIMATION'
+    ) return true;
+    var cls = classNameOf(node).toLowerCase();
+    return /\b(model-thoughts|thoughts-container|sources-carousel|structured-sources|sources-sidebar)\b/.test(cls);
+  }
+
+  function extractCiteName(aria) {
+    var text = String(aria || '').replace(/\s+/g, ' ').trim();
+    if (!text) return '';
+    // ChatGPT: 「国会会議録検索システム, 2件の情報源」
+    var chatgptGrouped = /^(.+?)\s*[,，]\s*\d+\s*件の情報源/.exec(text);
+    if (chatgptGrouped) return String(chatgptGrouped[1] || '').trim();
+    var match =
+      /^(.+?)\s*からの引用/.exec(text) ||
+      /citation from\s+(.+?)(?:\.|$)/i.exec(text) ||
+      /(?:引用元|出典|ソース)[：:\s]+(.+?)(?:\.|。|$)/.exec(text) ||
+      /from\s+([^.]{1,200})\./i.exec(text);
+    return match ? String(match[1] || '').trim() : '';
+  }
+
+  function stripTrackingParams(url) {
+    try {
+      var u = new URL(url);
+      ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'].forEach(function (key) {
+        u.searchParams.delete(key);
+      });
+      return u.href;
+    } catch (e) {
+      return url;
+    }
+  }
+
+  /** ChatGPT の data-assistant-sources-payload JSON から URL 一覧を取り出す */
+  function parseAssistantSourcesPayload(node) {
+    var items = [];
+    if (!node) return items;
+    var seen = {};
+    function takeAttr(el) {
+      if (!el || !el.getAttribute) return;
+      var raw = el.getAttribute('data-assistant-sources-payload');
+      if (!raw) return;
+      try {
+        var parsed = JSON.parse(raw.replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+        if (!Array.isArray(parsed)) return;
+        parsed.forEach(function (entry) {
+          if (!entry || typeof entry !== 'object') return;
+          var href = resolveHref(stripTrackingParams(String(entry.url || '')));
+          if (!href || isNoiseSourceUrl(href) || seen[href]) return;
+          seen[href] = true;
+          var title =
+            String(entry.attribution || entry.title || '').replace(/\s+/g, ' ').trim() || href;
+          items.push({ url: href, title: title });
+        });
+      } catch (e) {}
+    }
+    takeAttr(node);
+    if (node.querySelectorAll) {
+      node.querySelectorAll('[data-assistant-sources-payload]').forEach(takeAttr);
+    }
+    queryAllDeep(node, '[data-assistant-sources-payload]').forEach(takeAttr);
+    return items;
+  }
+
+  function assistantSourceUrls(node) {
+    return parseAssistantSourcesPayload(node).map(function (item) { return item.url; });
+  }
+
+  function isNoiseSourceUrl(url) {
+    try {
+      var u = new URL(url);
+      var host = u.hostname.replace(/^www\./i, '').toLowerCase();
+      var path = u.pathname || '/';
+      var here = location.href.split('#')[0];
+      if (u.href.split('#')[0] === here) return true;
+      if (host === 'chatgpt.com' || host.endsWith('.chatgpt.com')) {
+        // 会話本体以外のサイトクロム（ナビ・ログイン・ヘルプ）は参照にしない
+        if (/^\/?$/.test(path) || /^\/(c|uc)\//.test(path)) return true;
+        if (/^\/(auth|images|plugins|api|backend-api|public-api|share|search|g|codex|workspace|settings|account|payments?|checkout|anon|invite)\b/i.test(path)) return true;
+        return true;
+      }
+      if (host === 'openai.com' || host.endsWith('.openai.com')) {
+        if (/^\/(terms|privacy|policies|cookie|chatgpt\/pricing|product|blog|news|index|about|careers|security|compliance|research|customer-stories|form|login|signin)\b/i.test(path)) return true;
+        if (/help\.openai\.com$/i.test(u.hostname)) return true;
+      }
+      if (/help\.openai\.com$/i.test(host)) return true;
+      if (/gemini\.google\.com$/i.test(host) && /^\/(u\/\d+\/)?app\/?/.test(path)) return true;
+      if (/google\./i.test(host) && /^\/search\b/.test(path)) return true;
+      if (/gstatic\.com$/i.test(host)) return true;
+      if (/accounts\.google\.com$/i.test(host)) return true;
+      if (/microsoftonline\.com$|live\.com$|apple\.com$/i.test(host) && /\/(oauth|authorize|login|signin)/i.test(path + u.search)) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function linkFromCitation(node) {
+    var aria = '';
+    if (node.getAttribute) aria = node.getAttribute('aria-label') || '';
+    if (!aria && node.querySelector) {
+      var labeled = node.querySelector('[aria-label]');
+      if (labeled) aria = labeled.getAttribute('aria-label') || '';
+    }
+    var citeName = extractCiteName(aria);
+    var rawTitle = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    var chipTitle = normalizeCiteChipTitle(rawTitle);
+    var title = citeName || chipTitle;
+    if (!citeName && (!title || title.length <= 2 || /^[\d+＋・.]+$/.test(title))) title = '';
+    var payloadSources = parseAssistantSourcesPayload(node);
+    var href = findHrefDeep(node);
+    var logUrls = jslogUrlsDeep(node);
+    var noiseFiltered = [];
+    var rawHref = resolveHrefFromNode(node);
+    if (rawHref && isNoiseSourceUrl(rawHref)) noiseFiltered.push(rawHref);
+    var extra = {
+      resolvedHref: href || (payloadSources[0] && payloadSources[0].url) || '',
+      jslogUrls: logUrls,
+      noiseFiltered: noiseFiltered,
+      payloadCount: payloadSources.length,
+    };
+    if (payloadSources.length) {
+      var fromPayload = payloadSources.map(function (item) {
+        return '<a href="' + esc(item.url) + '">' + esc(item.title || title || citeName || item.url) + '</a>';
+      }).join('');
+      recordCitationDebug(node, fromPayload, payloadSources.length > 1 ? 'payload-multi' : 'payload', extra);
+      return fromPayload;
+    }
+    if (logUrls.length > 1) {
+      var multi = logUrls.map(function (u) {
+        return '<a href="' + esc(u) + '">' + esc(title || citeName || u) + '</a>';
+      }).join('');
+      recordCitationDebug(node, multi, 'jslog-multi', extra);
+      return multi;
+    }
+    if (href) {
+      var anchor = '<a href="' + esc(href) + '">' + esc(title || citeName || href) + '</a>';
+      recordCitationDebug(node, anchor, 'anchor', extra);
+      return anchor;
+    }
+    var textUrl = firstHttpUrl(title + ' ' + aria + ' ' + (node.innerText || ''));
+    if (textUrl) {
+      var textAnchor = '<a href="' + esc(textUrl) + '">' + esc(title || textUrl) + '</a>';
+      recordCitationDebug(node, textAnchor, 'anchor', extra);
+      return textAnchor;
+    }
+    // URL が無いチップは内側の通常リンクを捨てない
+    var inner = '';
+    if (node.shadowRoot) inner += sanitize(node.shadowRoot);
+    node.childNodes.forEach(function (child) { inner += sanitize(child); });
+    if (/<a\s/i.test(inner)) {
+      recordCitationDebug(node, inner, 'inner-anchor', extra);
+      return inner;
+    }
+    if (citeName || title) {
+      var named = '<span data-ct-cite-name="' + esc(citeName || title) + '"></span>';
+      recordCitationDebug(node, named, 'cite-name', extra);
+      return named;
+    }
+    recordCitationDebug(node, inner, 'empty', extra);
+    return inner;
+  }
+
+  function normalizeCiteChipTitle(text) {
+    var value = String(text || '')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s*[+＋]\d+\s*$/g, '')
+      .replace(/\s*,\s*\d+\s*件の情報源\s*$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    // ChatGPT が favicon 文字を重ねる例: WWebull → Webull / 国 国会… → 国会…
+    if (/^([A-Za-z])\1[A-Za-z]/.test(value)) value = value.slice(1);
+    var faviconCjk = /^([\u3040-\u30ff\u4e00-\u9fff])\s+\1/.exec(value);
+    if (faviconCjk) value = value.replace(/^[\u3040-\u30ff\u4e00-\u9fff]\s+/, '');
+    return value;
+  }
+
+  /** sanitize 後に残った「Name+1」プレーンテキストを脚注マーカーへ */
+  function replaceBareCiteChipsInHtml(html) {
+    if (!html) return html;
+    var parts = String(html).split(/(<[^>]+>)/g);
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i] || parts[i].charAt(0) === '<') continue;
+      parts[i] = parts[i].replace(
+        /([A-Za-z\u3040-\u30ff\u4e00-\u9fff][A-Za-z0-9._\u3040-\u30ff\u4e00-\u9fff -]{0,40}?)\s*[+＋](\d+)(?=[^\w+]|$)/g,
+        function (all, name) {
+          var cleaned = normalizeCiteChipTitle(name);
+          if (!cleaned || cleaned.length < 2) return all;
+          if (debugCitationsEnabled() && debugCitationRecords.length < 20) {
+            debugCitationRecords.push({
+              tag: '#text',
+              className: '',
+              ariaLabel: '',
+              attrs: { hasJslog: false },
+              resolvedHref: '',
+              jslogUrls: [],
+              noiseFiltered: [],
+              output: '<span data-ct-cite-name="' + esc(cleaned) + '"></span>',
+              outcome: 'bare-text',
+            });
+          }
+          return '<span data-ct-cite-name="' + esc(cleaned) + '"></span>';
+        },
+      );
+    }
+    return parts.join('');
+  }
+
+  function extractLinksHtml(node) {
+    var html = '';
+    var seen = {};
+    function add(href, title) {
+      if (!href || seen[href] || isNoiseSourceUrl(href)) return;
+      seen[href] = true;
+      html += '<a href="' + esc(href) + '">' + esc(title || href) + '</a>';
+    }
+    queryAllDeep(node, 'a[href], [data-href], [data-url], [data-source-url], [data-external-url], [data-absolute-url], source-inline-chip, button[aria-label*="citation"]').forEach(function (el) {
+      var href = findHrefDeep(el);
+      var aria = String(el.getAttribute && el.getAttribute('aria-label') || '');
+      var title = extractCiteName(aria) || String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() || href;
+      add(href, title);
+      jslogUrlsDeep(el).forEach(function (u) { add(u, title); });
+    });
+    var textUrls = String(node.innerText || node.textContent || '').match(/https?:\/\/[^\s<>"']+/gi) || [];
+    textUrls.forEach(function (raw) {
+      add(resolveHref(raw.replace(/[.,;:!?)]+$/g, '')), raw);
+    });
+    return html;
+  }
+
+  function mergeMissingLinks(html, extraLinks) {
+    if (!extraLinks) return html;
+    var missing = '';
+    String(extraLinks).replace(/<a href="([^"]+)"[^>]*>[\s\S]*?<\/a>/g, function (tag, href) {
+      if (html.indexOf(href) < 0) missing += tag;
+      return tag;
+    });
+    return missing ? html + missing : html;
+  }
+
+  function addSource(map, title, url) {
+    var href = resolveHref(url);
+    if (!href || isNoiseSourceUrl(href)) return;
+    var label = String(title || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || href;
+    if (!map.has(href)) map.set(href, label);
+  }
+
+  function collectSourcesFromRoot(root, map) {
+    if (!root) return;
+    queryAllDeep(
+      root,
+      'a[href], [data-href], [data-url], [data-source-url], [data-absolute-url], [data-testid*="citation"], [data-assistant-sources-payload], [data-assistant-sources-trigger], source-inline-chip, sources-carousel-inline, button[aria-label*="citation"], button[aria-label*="引用"], button[aria-label*="出典"], button[aria-label*="情報源"]'
+    ).forEach(function (el) {
+      var href = findHrefDeep(el);
+      if (!href && el.closest) {
+        var parent = el.closest('a');
+        if (parent) href = findHrefDeep(parent);
+      }
+      var aria = String(el.getAttribute && el.getAttribute('aria-label') || '');
+      var title = extractCiteName(aria) || String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+      addSource(map, title, href);
+      jslogUrlsDeep(el).forEach(function (u) { addSource(map, title, u); });
+      parseAssistantSourcesPayload(el).forEach(function (item) {
+        addSource(map, item.title || title, item.url);
+      });
+    });
+  }
+
+  function collectSourcesFromHtml(html, map) {
+    String(html || '').replace(/<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, function (_all, href, inner) {
+      addSource(map, plainText(inner), href);
+      return _all;
+    });
+    var withoutTags = String(html || '').replace(/<[^>]+>/g, ' ');
+    var urls = withoutTags.match(/https?:\/\/[^\s<>"']+/gi) || [];
+    urls.forEach(function (raw) {
+      addSource(map, raw, raw.replace(/[.,;:!?)]+$/g, ''));
+    });
+  }
+
+  async function tryCollectFromSourcesFlyout(map) {
+    var buttons = queryAllDeep(document, 'button');
+    var target = null;
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      var cls = classNameOf(btn).toLowerCase();
+      var blob = ((btn.getAttribute('aria-label') || '') + ' ' + (btn.getAttribute('data-testid') || '') + ' ' + (btn.innerText || '') + ' ' + cls).toLowerCase();
+      // ナビやログインを誤クリックしないよう、出典パネル系に寄せる
+      if (
+        /legacy-sources-sidebar|sources-sidebar|sources-carousel|structured-sources|出典|引用元|参考文献/.test(blob) ||
+        (/^(sources|citations|ソース)\b/.test(blob.replace(/\s+/g, ' ').trim()) && !/login|サインイン|新規登録/.test(blob))
+      ) {
+        target = btn;
+        break;
+      }
+    }
+    if (!target) return;
+    try {
+      target.click();
+      await delay(450);
+      harvestOpenSourcePanels(map);
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      await delay(120);
+    } catch (e) {}
+  }
+
+  function harvestOpenSourcePanels(map) {
+    var flyouts = queryAllDeep(
+      document,
+      '[data-testid="screen-threadFlyOut"], [data-testid*="flyout"], [data-testid*="FlyOut"], [role="dialog"], [role="complementary"], [data-radix-popper-content-wrapper], [data-state="open"], sources-sidebar, sidebar-sources, .sources-sidebar, .legacy-sources-sidebar, structured-sources-block'
+    );
+    flyouts.forEach(function (flyout) { collectSourcesFromRoot(flyout, map); });
+    queryAllDeep(
+      document,
+      'sources-sidebar, sidebar-sources, .sources-sidebar, .legacy-sources-sidebar, structured-sources-block, sources-carousel, sources-carousel-inline'
+    ).forEach(function (el) {
+      collectSourcesFromRoot(el, map);
+    });
+  }
+
+  async function expandChatgptCitationPills(map) {
+    // クリック不要: payload 属性に URL が入っている
+    queryAllDeep(document, '[data-assistant-sources-payload], [data-assistant-sources-trigger]').forEach(function (el) {
+      parseAssistantSourcesPayload(el).forEach(function (item) {
+        addSource(map, item.title, item.url);
+      });
+    });
+    var pills = [];
+    var seen = new Set();
+    function addPill(el) {
+      if (!el || seen.has(el)) return;
+      seen.add(el);
+      pills.push(el);
+    }
+    queryAllDeep(
+      document,
+      '[data-testid="webpage-citation-pill"], [data-testid*="citation-pill"], [data-testid*="citation"], button[class*="footnote"], [data-assistant-sources-trigger]'
+    ).forEach(addPill);
+    queryAllDeep(document, 'button, a[href], [role="button"]').forEach(function (el) {
+      if (looksLikeCiteChipText(el) || /footnote|citation/i.test(classNameOf(el))) addPill(el);
+    });
+    // 会話内の target=_blank リンクは ChatGPT 引用の本体であることが多い
+    conversationSourceRoots().forEach(function (root) {
+      queryAllDeep(root, 'a[href][target="_blank"], a[href][rel*="noopener"]').forEach(function (el) {
+        var href = findHrefDeep(el);
+        var title = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        addSource(map, normalizeCiteChipTitle(title) || title, href);
+      });
+      queryAllDeep(root, '[data-assistant-sources-payload]').forEach(function (el) {
+        parseAssistantSourcesPayload(el).forEach(function (item) {
+          addSource(map, item.title, item.url);
+        });
+      });
+    });
+    if (map.size > 0) return;
+    var limit = Math.min(pills.length, 10);
+    for (var i = 0; i < limit; i++) {
+      try {
+        var before = map.size;
+        var clickable = pills[i].querySelector
+          ? (pills[i].querySelector('a[href], button, [role="button"]') || pills[i])
+          : pills[i];
+        clickable.click();
+        await delay(350);
+        harvestOpenSourcePanels(map);
+        queryAllDeep(document, '[data-state="open"] a[href], [data-radix-popper-content-wrapper] a[href], [role="dialog"] a[href]').forEach(function (el) {
+          addSource(map, String(el.innerText || '').replace(/\s+/g, ' ').trim(), findHrefDeep(el));
+        });
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        await delay(120);
+        if (map.size === before && i > 2 && map.size > 0) break;
+      } catch (e) {}
+    }
+  }
+
+  function conversationSourceRoots() {
+    var roots = queryAllDeep(
+      document,
+      'main, [role="main"], [data-testid="conversation"], [data-testid*="conversation"], .conversation, user-query, model-response, [data-message-author-role], [data-message-role]'
+    );
+    var filtered = [];
+    var seen = [];
+    roots.forEach(function (root) {
+      if (!root || seen.indexOf(root) >= 0) return;
+      // ナビ・フッター配下は除外
+      if (root.closest && root.closest('nav, footer, [data-testid*="sidebar"], aside')) return;
+      seen.push(root);
+      filtered.push(root);
+    });
+    return filtered;
+  }
+
+  async function collectSourcesForSave(collectedMap) {
+    var map = new Map();
+    if (collectedMap) {
+      collectedMap.forEach(function (item) {
+        collectSourcesFromHtml(item.html, map);
+      });
+    }
+    // ページ全体ではなく会話領域だけ（ChatGPT のログイン/ナビリンク混入を防ぐ）
+    var roots = conversationSourceRoots();
+    if (roots.length) roots.forEach(function (root) { collectSourcesFromRoot(root, map); });
+    await tryCollectFromSourcesFlyout(map);
+    // ChatGPT: インライン引用 pill を開いて URL を回収
+    if (location.hostname.indexOf('chatgpt.com') >= 0 || location.hostname.indexOf('chat.openai.com') >= 0) {
+      await expandChatgptCitationPills(map);
+    }
+    var sources = [];
+    map.forEach(function (title, url) {
+      sources.push({ title: title, url: url });
+    });
+    return sources;
+  }
+
+  function languageOf(node) {
+    if (!node || !node.getAttribute) return '';
+    var className = typeof node.className === 'string' ? node.className : '';
+    var match = /(?:^|\s)(?:language|lang)-([A-Za-z0-9_+-]+)/.exec(className);
+    if (match) return match[1];
+    var data = node.getAttribute('data-language') || node.getAttribute('data-lang') || '';
+    data = String(data).trim();
+    if (/^[A-Za-z0-9_+-]+$/.test(data)) return data;
+    return '';
+  }
+
+  function classNameOf(node) {
+    if (!node) return '';
+    if (typeof node.className === 'string') return node.className;
+    if (node.className && typeof node.className.baseVal === 'string') return node.className.baseVal;
+    return (node.getAttribute && node.getAttribute('class')) || '';
+  }
+
+  function stripMathDelimiters(latex) {
+    var s = String(latex || '').trim();
+    if (/^\$\$[\s\S]*\$\$$/.test(s)) return s.replace(/^\$\$/, '').replace(/\$\$$/, '').trim();
+    if (s.length >= 2 && s.charAt(0) === '$' && s.charAt(s.length - 1) === '$' && s.charAt(1) !== '$') {
+      return s.slice(1, -1).trim();
+    }
+    if (s.indexOf('\\(') === 0 && s.lastIndexOf('\\)') === s.length - 2) return s.slice(2, -2).trim();
+    if (s.indexOf('\\[') === 0 && s.lastIndexOf('\\]') === s.length - 2) return s.slice(2, -2).trim();
+    return s;
+  }
+
+  function isDisplayMath(node) {
+    var cls = classNameOf(node).toLowerCase();
+    if (/\bkatex-display\b/.test(cls) || /\bmath-display\b/.test(cls) || /\bdisplay-math\b/.test(cls)) return true;
+    if ((node.getAttribute('display') || '').toLowerCase() === 'block') return true;
+    if ((node.getAttribute('data-display') || '').toLowerCase() === 'true') return true;
+    if (node.tagName === 'MJX-CONTAINER' && (node.getAttribute('display') || '') === 'true') return true;
+    if (node.querySelector) {
+      var math = node.querySelector('math');
+      if (math && (math.getAttribute('display') || '').toLowerCase() === 'block') return true;
+    }
+    return false;
+  }
+
+  function isMathRoot(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var cls = classNameOf(node).toLowerCase();
+    if (/\bkatex-display\b/.test(cls)) return true;
+    if (/\bkatex\b/.test(cls)) {
+      var parent = node.parentElement;
+      if (parent && /\bkatex/i.test(classNameOf(parent))) return false;
+      return true;
+    }
+    if (node.tagName === 'MJX-CONTAINER' || node.tagName === 'MATH') return true;
+    if (node.getAttribute && node.getAttribute('data-math') != null && String(node.getAttribute('data-math')).trim()) return true;
+    var testId = String(node.getAttribute && node.getAttribute('data-testid') || '').toLowerCase();
+    if (testId.indexOf('math') >= 0 && node.querySelector && node.querySelector('annotation')) return true;
+    if (/\bmath-inline\b|\bmath-display\b|\bdisplay-math\b|\binline-math\b/.test(cls) && node.querySelector && node.querySelector('annotation, .katex')) return true;
+    return false;
+  }
+
+  function extractLatex(node) {
+    if (!node) return '';
+    if (node.getAttribute) {
+      var dataMath = node.getAttribute('data-math');
+      if (dataMath && String(dataMath).trim()) return String(dataMath).trim();
+      var dataLatex = node.getAttribute('data-latex') || node.getAttribute('data-tex');
+      if (dataLatex && String(dataLatex).trim()) return String(dataLatex).trim();
+    }
+    if (node.querySelector) {
+      var ann =
+        node.querySelector('annotation[encoding="application/x-tex"]') ||
+        node.querySelector('annotation[encoding="LaTeX"]') ||
+        node.querySelector('annotation');
+      if (ann) {
+        var tex = String(ann.textContent || '').trim();
+        if (tex) return tex;
+      }
+    }
+    if (node.tagName === 'SCRIPT') {
+      var scriptTex = String(node.textContent || '').trim();
+      if (scriptTex) return scriptTex;
+    }
+    return '';
+  }
+
+  function formatMathHtml(display, latex) {
+    var body = stripMathDelimiters(latex);
+    if (!body) return '';
+    return '<span data-ct-math="' + (display ? 'display' : 'inline') + '">' + esc(body) + '</span>';
+  }
+
+  function mathFromNode(node) {
+    var latex = extractLatex(node);
+    if (!latex) {
+      var label = String((node.getAttribute && node.getAttribute('aria-label')) || '').trim();
+      return label ? esc(label) : '';
+    }
+    return formatMathHtml(isDisplayMath(node), latex);
+  }
+
+  function isActionControl(node) {
+    var label = ((node.getAttribute('aria-label') || '') + ' ' + (node.getAttribute('data-testid') || '')).toLowerCase();
+    return /copy|share|edit|regenerate|thumbs|more|menu|good|bad|コピー|共有|編集|再生成|その他/.test(label);
+  }
+
+  function plainText(html) {
+    return String(html || '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
+  }
+
+  function isResponseLabelText(text) {
+    var value = String(text || '').replace(/\s+/g, ' ').trim();
+    return /^(chatgpt|gemini)\s*(の回答|の返答| response|'?s response)?$/i.test(value)
+      || /^(あなたのプロンプト|your prompt)\s*[:：]?$/i.test(value);
+  }
+
+  function isPromptLabelNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || '').toLowerCase();
+    var cls = classNameOf(node).toLowerCase();
+    if (/query-title|prompt-label|user-query-title|query-over-plain/.test(tag + ' ' + cls)) return true;
+    var text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    return /^(あなたのプロンプト|your prompt)\s*[:：]?$/i.test(text);
+  }
+
+  function collapseDuplicatedPhrase(text) {
+    var value = String(text || '').replace(/\s+/g, ' ').trim();
+    var spaced = /^(.+?)(?:[\s\u3000]+)(?:[:：]\s*)?\1$/.exec(value);
+    if (spaced) return spaced[1].trim();
+    if (value.length >= 2 && value.length % 2 === 0) {
+      var half = value.slice(0, value.length / 2);
+      if (half && half === value.slice(value.length / 2)) return half;
+    }
+    return String(text || '');
+  }
+
+  function stripPromptPrefix(text) {
+    return collapseDuplicatedPhrase(
+      String(text || '')
+        .replace(/(?:あなたのプロンプト|Your prompt)\s*[:：]\s*/gi, '')
+        .replace(/^(?:あなたのプロンプト|Your prompt)\s*/i, '')
+        .trim(),
+    );
+  }
+
+  function stripResponseLabels(html) {
+    var result = String(html || '')
+      .replace(/<(p|h[1-6]|div|span|header)(\s[^>]*)?>([\s\S]*?)<\/\1>/gi, function (all, tag, _attrs, inner) {
+        var text = plainText(inner);
+        if (/^(chatgpt|gemini)\s*(の回答|の返答)$/i.test(text) || isResponseLabelText(text)) return '';
+        var cleaned = stripPromptPrefix(text);
+        if (!cleaned) return '';
+        if (cleaned !== text) return '<' + tag + '>' + esc(cleaned) + '</' + tag + '>';
+        return all;
+      })
+      .replace(/^\s*(?:ChatGPT|Gemini)\s*(?:の回答|の返答)\s*/i, '')
+      .replace(/^\s*(?:あなたのプロンプト|Your prompt)\s*[:：]?\s*/i, '')
+      .trim();
+    return dedupeAdjacentPlainBlocks(result);
+  }
+
+  // 同じ本文がラベル側と本文側で二重に入るのを防ぐ
+  function dedupeAdjacentPlainBlocks(html) {
+    var parts = String(html || '').match(/<p\b[^>]*>[\s\S]*?<\/p>|<[^>]+>|[^<]+/gi) || [];
+    var out = [];
+    var prevText = '';
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      var text = plainText(part).replace(/\s+/g, ' ').trim();
+      if (/^<p\b/i.test(part) && text && text === prevText) continue;
+      if (!/^</.test(part) && text && text === prevText) continue;
+      if (text) prevText = text;
+      out.push(part);
+    }
+    return out.join('').trim();
+  }
+
+  function isChrome(html) {
+    if (/data-ct-media=/i.test(html || '') || /data-ct-math=/i.test(html || '') || /https?:\/\//i.test(html || '')) return false;
+    var text = plainText(html);
+    if (/^(chatgpt:?|gemini|思考中|thinking)$/i.test(text)) return true;
+    if (isResponseLabelText(text)) return true;
+    var stripped = text
+      .replace(/chatgpt:?/ig, '')
+      .replace(/(?:chatgpt|gemini)\s*(?:の回答|の返答)/ig, '')
+      .replace(/(?:あなたのプロンプト|your prompt)\s*[:：]?/ig, '')
+      .replace(/ウェブを検索しています/g, '')
+      .replace(/ウェブを検索中/g, '')
+      .replace(/検索しています/g, '')
+      .replace(/searching the web/ig, '')
+      .replace(/searched the web/ig, '')
+      .replace(/\d+\s*\./g, '')
+      .replace(/\s+/g, '');
+    return stripped.length === 0;
+  }
+
+  var captureClaimed = new Set();
+
+  function resetMedia() {
+    mediaElements.clear();
+    mediaMeta.clear();
+    mediaSeq = 0;
+    captureClaimed.clear();
+  }
+
+  function registerMedia(el, kind, extra) {
+    var id = 'm' + (++mediaSeq);
+    mediaElements.set(id, el);
+    var entry = { id: id, kind: kind };
+    if (extra) {
+      Object.keys(extra).forEach(function (key) { entry[key] = extra[key]; });
+    }
+    mediaMeta.set(id, entry);
+    return id;
+  }
+
+  function imageSrc(node) {
+    if (!node) return '';
+    var src = '';
+    try { src = node.currentSrc || ''; } catch (e) {}
+    if (!src) src = node.getAttribute('src') || '';
+    if (!src) {
+      var srcset = node.getAttribute('srcset') || '';
+      if (srcset) src = String(srcset).split(',')[0].trim().split(/\s+/)[0] || '';
+    }
+    src = String(src || '').trim();
+    if (!src) return '';
+    if (/^(https?:|data:|blob:)/i.test(src)) return src;
+    try { return new URL(src, location.href).href; } catch (e) { return ''; }
+  }
+
+  function isTinyVisual(el) {
+    var rect = el.getBoundingClientRect();
+    var w = Math.max(rect.width, el.offsetWidth || 0, Number(el.getAttribute('width')) || 0);
+    var h = Math.max(rect.height, el.offsetHeight || 0, Number(el.getAttribute('height')) || 0);
+    return w > 0 && h > 0 && (w < 48 || h < 48);
+  }
+
+  function looksLikeMap(el) {
+    return hasMapSignal(mapSignalBlob(el));
+  }
+
+  function mapSignalBlob(el) {
+    var parts = [];
+    var cur = el;
+    for (var depth = 0; cur && depth < 4; depth++) {
+      if (!cur.getAttribute) break;
+      parts.push(cur.getAttribute('aria-label') || '');
+      parts.push(cur.getAttribute('title') || '');
+      parts.push(cur.getAttribute('data-testid') || '');
+      parts.push(typeof cur.className === 'string' ? cur.className : '');
+      parts.push(cur.id || '');
+      parts.push(cur.getAttribute('src') || '');
+      parts.push(cur.getAttribute('data-src') || '');
+      cur = cur.parentElement;
+    }
+    return parts.join(' ').toLowerCase();
+  }
+
+  function hasMapSignal(blob) {
+    if (!blob) return false;
+    if (/maps\.google|google\.com\/maps|openstreetmap|mapbox\.com|leaflet|地図|geocode|maps\.apple/.test(blob)) return true;
+    return /\bmap\b/.test(blob) && /(google|osm|mapbox|leaflet|embed|iframe|place|geo)/.test(blob);
+  }
+
+  function parseMapUrl(url) {
+    var mapState = {};
+    var sourceUrl = String(url || '').trim();
+    if (!sourceUrl) return { sourceUrl: '', mapState: mapState };
+    try {
+      var u = new URL(sourceUrl);
+      var at = /@(-?\d+\.?\d*),(-?\d+\.?\d*),(\d+\.?\d*)z/.exec(u.href);
+      if (at) {
+        mapState.lat = Number(at[1]);
+        mapState.lng = Number(at[2]);
+        mapState.zoom = Number(at[3]);
+      }
+      var d3 = /!3d(-?\d+\.?\d*)/.exec(u.href);
+      var d2 = /!2d(-?\d+\.?\d*)/.exec(u.href);
+      if (d3 && d2) {
+        mapState.lat = Number(d3[1]);
+        mapState.lng = Number(d2[1]);
+      }
+      var q = u.searchParams.get('q') || u.searchParams.get('query');
+      if (q) mapState.query = q;
+      var ll = u.searchParams.get('ll');
+      if (ll) {
+        var parts = ll.split(',');
+        if (parts.length >= 2 && Number.isFinite(Number(parts[0])) && Number.isFinite(Number(parts[1]))) {
+          mapState.lat = Number(parts[0]);
+          mapState.lng = Number(parts[1]);
+        }
+      }
+      var z = u.searchParams.get('z') || u.searchParams.get('zoom');
+      if (z && Number.isFinite(Number(z))) mapState.zoom = Number(z);
+      var marker = u.searchParams.get('marker');
+      if (marker) {
+        var m = marker.split(',');
+        if (m.length >= 2 && Number.isFinite(Number(m[0])) && Number.isFinite(Number(m[1]))) {
+          mapState.lat = Number(m[0]);
+          mapState.lng = Number(m[1]);
+        }
+      }
+    } catch (e) {}
+    return { sourceUrl: sourceUrl, mapState: mapState };
+  }
+
+  function extractMapInfo(node) {
+    var sourceUrl = '';
+    var mapState = {};
+    var tag = node.tagName;
+    if (tag === 'IFRAME') {
+      sourceUrl = resolveHref(node.getAttribute('src') || '') || String(node.src || '').trim();
+      try {
+        if (node.contentWindow && node.contentWindow.location) {
+          var loc = String(node.contentWindow.location.href || '');
+          if (/^https?:\/\//i.test(loc)) sourceUrl = loc;
+        }
+      } catch (e) {
+        console.info('[ChatTaker] map iframe cross-origin, skip contentDocument');
+      }
+    } else if (node.querySelector) {
+      var iframe = node.querySelector('iframe[src]');
+      if (iframe) sourceUrl = resolveHref(iframe.getAttribute('src') || '') || String(iframe.src || '').trim();
+    }
+    if (sourceUrl) {
+      var parsed = parseMapUrl(sourceUrl);
+      sourceUrl = parsed.sourceUrl || sourceUrl;
+      mapState = parsed.mapState || {};
+    }
+    return { sourceUrl: sourceUrl, mapState: mapState };
+  }
+
+  function isMapNode(node) {
+    if (!node || !node.tagName || captureClaimed.has(node) || isTinyVisual(node)) return false;
+    if (node.closest && node.closest('button, [data-message-actions], [data-assistant-message-actions]')) return false;
+    if (!hasMapSignal(mapSignalBlob(node))) return false;
+    var tag = node.tagName;
+    if (tag === 'IFRAME') return true;
+    if (tag === 'CANVAS') return true;
+    if (node.getAttribute && node.getAttribute('role') === 'img') return true;
+    return false;
+  }
+
+  function registerImageNode(node) {
+    if (isTinyVisual(node)) return '';
+    var src = imageSrc(node);
+    if (!src) return '';
+    var id = registerMedia(node, 'image', { src: src });
+    return '<img data-ct-media="' + esc(id) + '" alt="">';
+  }
+
+  function markCaptureClaimed(node) {
+    if (!node) return;
+    captureClaimed.add(node);
+    queryAllDeep(node, 'canvas, iframe, [role="img"]').forEach(function (child) {
+      captureClaimed.add(child);
+    });
+  }
+
+  function registerMapNode(node) {
+    if (!node || captureClaimed.has(node) || isTinyVisual(node)) return '';
+    if (node.closest && node.closest('button, [data-message-actions], [data-assistant-message-actions]')) return '';
+    console.info('[ChatTaker] map detected');
+    var info = extractMapInfo(node);
+    console.info('[ChatTaker] map source URL:', info.sourceUrl || '(none)');
+    console.info('[ChatTaker] map state:', JSON.stringify(info.mapState || {}));
+    var extra = {};
+    if (info.sourceUrl) extra.sourceUrl = info.sourceUrl;
+    if (info.mapState && Object.keys(info.mapState).length) extra.mapState = info.mapState;
+    var id = registerMedia(node, 'map', extra);
+    markCaptureClaimed(node);
+    return '<img data-ct-media="' + esc(id) + '" alt="map">';
+  }
+
+  function registerCaptureNode(node) {
+    if (!node || captureClaimed.has(node) || isTinyVisual(node)) return '';
+    if (node.closest && node.closest('button, [data-message-actions], [data-assistant-message-actions]')) return '';
+    var id = registerMedia(node, 'capture', {});
+    markCaptureClaimed(node);
+    return '<img data-ct-media="' + esc(id) + '" alt="capture">';
+  }
+
+  function shouldCaptureAsScreenshot(node) {
+    if (!node || !node.tagName || captureClaimed.has(node)) return false;
+    if (node.closest && node.closest('button, [data-message-actions], [data-assistant-message-actions]')) return false;
+    if (isTinyVisual(node)) return false;
+    if (isMapNode(node)) return false;
+    var tag = node.tagName;
+    if (tag === 'CANVAS') return true;
+    if (tag === 'IFRAME' && looksLikeMap(node)) return true;
+    if (node.getAttribute && node.getAttribute('role') === 'img' && looksLikeMap(node)) return true;
+    return false;
+  }
+
+  function sanitize(node, inList) {
+    if (!node) return '';
+    if (node.nodeType === 3) return esc(node.nodeValue || '');
+    if (node.nodeType === 11) {
+      var fragment = '';
+      node.childNodes.forEach(function (child) { fragment += sanitize(child, inList); });
+      return fragment;
+    }
+    if (node.nodeType !== 1) return '';
+    var tag = node.tagName;
+    if (tag === 'STYLE' || tag === 'SVG' || tag === 'NOSCRIPT' || tag === 'TEXTAREA' || tag === 'INPUT') return '';
+    if (tag === 'SCRIPT') {
+      var scriptType = String(node.getAttribute('type') || '').toLowerCase();
+      if (scriptType.indexOf('math/tex') >= 0) {
+        var scriptLatex = extractLatex(node);
+        if (scriptLatex) return formatMathHtml(scriptType.indexOf('mode=display') >= 0, scriptLatex);
+      }
+      return '';
+    }
+    if (isMathRoot(node)) return mathFromNode(node);
+    if (isPromptLabelNode(node)) return '';
+    if (isSourcesChrome(node)) return extractLinksHtml(node);
+    if (isCitationPill(node)) return linkFromCitation(node);
+    if (tag === 'IMG') return registerImageNode(node);
+    if (isMapNode(node)) return registerMapNode(node);
+    if (shouldCaptureAsScreenshot(node)) return registerCaptureNode(node);
+    if (node.hasAttribute('data-message-attribution') || node.hasAttribute('data-assistant-message-actions') || node.hasAttribute('data-message-actions') || node.hasAttribute('data-copy-message') || node.hasAttribute('data-share-message')) return '';
+    var childInList = inList || tag === 'UL' || tag === 'OL';
+    var inner = '';
+    if (node.shadowRoot) inner += sanitize(node.shadowRoot, childInList);
+    node.childNodes.forEach(function (child) { inner += sanitize(child, childInList); });
+    if (isResponseLabelText(plainText(inner)) || isResponseLabelText(String(node.innerText || node.textContent || ''))) {
+      var leftover = inner.replace(/<[^>]+>/g, '').replace(/(?:ChatGPT|Gemini)\s*(?:の回答|の返答)/ig, '').replace(/(?:あなたのプロンプト|Your prompt)\s*[:：]?/ig, '').replace(/\s+/g, '');
+      if (!leftover) return '';
+    }
+    if (tag === 'BUTTON') {
+      if (isCitationPill(node)) return linkFromCitation(node);
+      if (isActionControl(node) || !inner.replace(/<[^>]+>/g, '').trim()) return '';
+      return inner;
+    }
+    if (tag === 'BR') return '<br>';
+    if (tag === 'HR') return '<hr>';
+    if (tag === 'A') {
+      if (isCitationPill(node) || looksLikeCiteChipText(node)) return linkFromCitation(node);
+      var href = resolveHrefFromNode(node);
+      var anchorText = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+      var textUrl = firstHttpUrl(anchorText || inner);
+      if (textUrl && (!href || isNoiseSourceUrl(href))) href = textUrl;
+      if (href && isNoiseSourceUrl(href)) return inner;
+      if (!href) return inner;
+      if (!inner.replace(/<[^>]+>/g, '').trim()) inner = esc(anchorText || href);
+      return '<a href="' + esc(href) + '">' + inner + '</a>';
+    }
+    var keep = { P:1, STRONG:1, B:1, EM:1, I:1, CODE:1, PRE:1, UL:1, OL:1, LI:1, H1:1, H2:1, H3:1, H4:1, BLOCKQUOTE:1, TABLE:1, THEAD:1, TBODY:1, TR:1, TH:1, TD:1 };
+    if (!keep[tag] || (tag === 'LI' && !inList)) return inner;
+    var name = tag.toLowerCase();
+    var lang = '';
+    if (tag === 'CODE' || tag === 'PRE') {
+      lang = languageOf(node);
+      if (!lang && tag === 'PRE' && node.querySelector) {
+        var code = node.querySelector('code');
+        if (code) lang = languageOf(code);
+      }
+    }
+    if (lang) return '<' + name + ' class="language-' + esc(lang) + '">' + inner + '</' + name + '>';
+    return '<' + name + '>' + inner + '</' + name + '>';
+  }
+
+  function collectCapturePlaceholders(root) {
+    var html = '';
+    var mapCandidates = [];
+    var captureCandidates = [];
+    queryAllDeep(root, 'canvas, iframe, [role="img"]').forEach(function (el) {
+      if (captureClaimed.has(el)) return;
+      if (isMapNode(el)) mapCandidates.push(el);
+      else if (shouldCaptureAsScreenshot(el)) captureCandidates.push(el);
+    });
+    outermost(mapCandidates).forEach(function (el) {
+      if (captureClaimed.has(el)) return;
+      html += registerMapNode(el);
+    });
+    outermost(captureCandidates).forEach(function (el) {
+      if (captureClaimed.has(el)) return;
+      html += registerCaptureNode(el);
+    });
+    return html;
+  }
+
+  function contentRoot(el) {
+    var copy = el.querySelector('[data-user-message-copy]');
+    if (copy) return copy;
+    var tag = String(el.tagName || '').toUpperCase();
+    // Gemini ユーザー質問: ラベル込みの親ではなく本文コンテナだけを取る
+    if (tag === 'USER-QUERY') {
+      var queryText =
+        el.querySelector('.query-text') ||
+        el.querySelector('.query-text-line') ||
+        el.querySelector('[id^="user-query-content-"]');
+      if (queryText) return queryText;
+    }
+    // Gemini: 本文コンテナがあればそこだけを対象にする（検索結果 UI を混ぜない）
+    var geminiBody =
+      el.querySelector('message-content') ||
+      el.querySelector('.model-response-text') ||
+      el.querySelector('[class*="markdown-main-panel"]') ||
+      el.querySelector('.markdown');
+    if (geminiBody) return geminiBody;
+    return el;
+  }
+
+  function buildMessage(el, role) {
+    var root = contentRoot(el);
+    var html = sanitize(root).replace(/\u00a0/g, ' ').trim();
+    // 位置が分からないキャプチャは末尾ではなく先頭へ置く
+    var unknownCapture = collectCapturePlaceholders(root);
+    if (unknownCapture) html = (unknownCapture + (html ? html : '')).replace(/\u00a0/g, ' ').trim();
+    html = stripResponseLabels(html.replace(/\u00a0/g, ' ').trim());
+    html = mergeMissingLinks(html, extractLinksHtml(el));
+    if (role !== 'user') html = replaceBareCiteChipsInHtml(html);
+    if (role === 'user') {
+      var userText = stripPromptPrefix(plainText(html));
+      if (userText && userText !== plainText(html)) html = '<p>' + esc(userText) + '</p>';
+    }
+    if (!html) {
+      var text = (root.innerText || '').replace(/\u00a0/g, ' ').trim();
+      if (text && !isResponseLabelText(text)) html = '<p>' + esc(text) + '</p>';
+    }
+    if (!html || isChrome(html)) return null;
+    var media = [];
+    String(html).replace(/data-ct-media="([^"]+)"/g, function (_all, id) {
+      var entry = mediaMeta.get(id);
+      if (entry) media.push(entry);
+      return _all;
+    });
+    return { role: role, html: html, media: media };
+  }
+
+  function isStreaming() {
+    var buttons = queryAllDeep(document, 'button');
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      var testId = (btn.getAttribute('data-testid') || '').toLowerCase();
+      if (testId.indexOf('stop') >= 0) return true;
+      var label = ((btn.getAttribute('aria-label') || '') + ' ' + (btn.innerText || '')).toLowerCase();
+      if (label.indexOf('stop streaming') >= 0 || label.indexOf('stop generating') >= 0 || label.indexOf('生成を停止') >= 0 || label.indexOf('停止する') >= 0) return true;
+    }
+    return false;
+  }
+
+  function findScroller(doc, seed) {
+    var node = seed ? seed.parentElement : (doc.querySelector('main') || null);
+    while (node && node !== doc.body) {
+      var style = getComputedStyle(node);
+      var scrollable = style.overflowY === 'auto' || style.overflowY === 'scroll' || style.overflowY === 'overlay';
+      if (scrollable && node.scrollHeight > node.clientHeight + 20) return node;
+      node = node.parentElement;
+    }
+    return doc.scrollingElement || doc.documentElement;
+  }
+
+  function bytesToBase64(bytes) {
+    var chunk = 0x8000;
+    var parts = [];
+    for (var i = 0; i < bytes.length; i += chunk) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)));
+    }
+    return btoa(parts.join(''));
+  }
+
+  async function fetchImagePayload(src) {
+    if (!src) return { ok: false, error: 'empty src' };
+    try {
+      if (/^data:/i.test(src)) {
+        var comma = src.indexOf(',');
+        if (comma < 0) return { ok: false, error: 'bad data url' };
+        var header = src.slice(0, comma);
+        var mimeMatch = /data:([^;]+)/i.exec(header);
+        var mime = mimeMatch ? mimeMatch[1] : 'image/png';
+        var data = src.slice(comma + 1);
+        if (/;base64/i.test(header)) {
+          return { ok: true, mime: mime, base64: data };
+        }
+        return { ok: true, mime: mime, base64: btoa(unescape(encodeURIComponent(data))) };
+      }
+      if (/^blob:/i.test(src) || /^https?:/i.test(src)) {
+        var res = await fetch(src, { credentials: 'include', cache: 'force-cache' });
+        if (!res.ok) return { ok: false, error: 'http ' + res.status };
+        var buffer = await res.arrayBuffer();
+        var mimeType = (res.headers.get('content-type') || 'image/png').split(';')[0].trim() || 'image/png';
+        return { ok: true, mime: mimeType, base64: bytesToBase64(new Uint8Array(buffer)) };
+      }
+      return { ok: false, error: 'unsupported src' };
+    } catch (error) {
+      return { ok: false, error: String(error && error.message ? error.message : error) };
+    }
+  }
+
+  window.__ctFetchImage = function (src) {
+    return fetchImagePayload(String(src || ''));
+  };
+
+  window.__ctPreparePrint = function () {
+    if (document.getElementById('ct-print-style')) return true;
+    var style = document.createElement('style');
+    style.id = 'ct-print-style';
+    style.textContent = [
+      'nav, aside, header, [data-testid="sidebar"], [data-testid="left-sidebar"],',
+      '[data-testid="conversation-turn-sidebar"], [class*="Sidebar"], [class*="sidebar"],',
+      '[class*="nav-"], form textarea, form [contenteditable="true"],',
+      'button[data-testid="composer-speech-button"], [data-testid="composer-plus-btn"],',
+      '[aria-label*="サイドバー"], [aria-label*="sidebar"], [aria-label*="サイド バー"] {',
+      '  display: none !important;',
+      '}',
+      'main, [role="main"], .conversation, [data-testid="conversation"] {',
+      '  max-width: 100% !important;',
+      '  width: 100% !important;',
+      '}'
+    ].join('\n');
+    document.documentElement.appendChild(style);
+    return true;
+  };
+
+  window.__ctRestorePrint = function () {
+    var style = document.getElementById('ct-print-style');
+    if (style) style.remove();
+    return true;
+  };
+
+  window.__ctFocusMedia = async function (id) {
+    var el = mediaElements.get(String(id || ''));
+    if (!el || !el.getBoundingClientRect) return null;
+    try {
+      el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+    } catch (e) {
+      try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e2) {}
+    }
+    await delay(350);
+    var rect = el.getBoundingClientRect();
+    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    var minTop = 96;
+    var targetTop = Math.max(minTop, Math.floor((vh - rect.height) / 2));
+    if (Math.abs(rect.top - targetTop) > 8) {
+      var scroller = findScroller(document, el);
+      if (scroller) {
+        scroller.scrollTop += Math.floor(rect.top - targetTop);
+        await delay(220);
+        rect = el.getBoundingClientRect();
+      }
+    }
+    var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    var x = Math.max(0, Math.floor(rect.left));
+    var y = Math.max(0, Math.floor(rect.top));
+    var right = Math.min(vw, Math.ceil(rect.right));
+    var bottom = Math.min(vh, Math.ceil(rect.bottom));
+    var width = Math.max(0, right - x);
+    var height = Math.max(0, bottom - y);
+    if (width < 8 || height < 8) return null;
+    return { x: x, y: y, width: width, height: height };
+  };
+
+  function installChatGPT() {
+    if (window.__ctChatReady) return;
+    window.__ctChatReady = true;
+
+    var specific = '[data-message-author-role], [data-message-role="user"], [data-message-role="assistant"], [data-turn="user"], [data-turn="assistant"]';
+    var fallback = '[data-testid*="conversation-turn"], [class*="agent-turn"], [class*="conversation-turn"]';
+    var collected = new Map();
+    var session = nextSession();
+    var conv = convId();
+    var fullScanned = !conv;
+    var scanning = false;
+    var scanToken = 0;
+
+    function convId() {
+      var path = location.pathname || '';
+      var chat = /\/(?:c|uc)\/([^/]+)/.exec(path);
+      if (chat) return chat[1];
+      var share = /\/share\/([^/]+)/.exec(path);
+      if (share) return 'share:' + share[1];
+      return '';
+    }
+
+    function roleOf(el) {
+      function raw(node) {
+        if (!node || !node.getAttribute) return '';
+        return (node.getAttribute('data-message-author-role') || node.getAttribute('data-message-role') || node.getAttribute('data-turn') || node.getAttribute('data-author') || '').toLowerCase();
+      }
+      var role = raw(el);
+      if (!role) {
+        var inner = el.querySelector('[data-message-author-role], [data-message-role], [data-turn]');
+        role = raw(inner);
+      }
+      if (role.indexOf('user') >= 0) return 'user';
+      if (role.indexOf('assistant') >= 0) return 'assistant';
+      var className = typeof el.className === 'string' ? el.className : '';
+      var blob = ((el.getAttribute('data-testid') || '') + ' ' + className).toLowerCase();
+      if (blob.indexOf('user') >= 0 && blob.indexOf('assistant') < 0) return 'user';
+      return 'assistant';
+    }
+
+    function add(el) {
+      var message = buildMessage(el, roleOf(el));
+      if (!message) return;
+      var id = el.getAttribute('data-message-id') || el.getAttribute('data-turn-id') || el.getAttribute('data-canonical-dil-message-id');
+      var key = id || (message.role + '\n' + plainText(message.html));
+      var previous = collected.get(key);
+      if (!previous || plainText(message.html).length >= plainText(previous.html).length) {
+        collected.set(key, message);
+      }
+    }
+
+    function harvest(selector) {
+      var docs = allDocs();
+      docs.forEach(function (doc) {
+        outermost(queryAllDeep(doc, selector)).forEach(add);
+      });
+    }
+
+    async function fullScan() {
+      if (fullScanned || !convId()) return;
+      var token = ++scanToken;
+      var scanSession = session;
+      fullScanned = true;
+      scanning = true;
+      var sc = null;
+      var prev = 0;
+      try {
+        var seed = queryAllDeep(document, specific)[0] || document.querySelector('main');
+        sc = findScroller(document, seed);
+        prev = sc ? sc.scrollTop : 0;
+        collected.clear();
+        resetMedia();
+        if (sc) {
+          sc.scrollTop = 0;
+          await delay(150);
+          if (session !== scanSession) return;
+          harvest(specific);
+          var stuck = 0;
+          for (var i = 0; i < 60; i++) {
+            if (session !== scanSession) return;
+            var before = sc.scrollTop;
+            var step = Math.max(240, Math.floor(sc.clientHeight * 0.7));
+            sc.scrollTop = before + step;
+            await delay(100);
+            harvest(specific);
+            var atEnd = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 4;
+            if (sc.scrollTop === before) {
+              if (atEnd || ++stuck >= 3) break;
+            } else {
+              stuck = 0;
+            }
+            if (atEnd) break;
+          }
+        } else {
+          harvest(specific);
+        }
+        if (!collected.size && session === scanSession) harvest(fallback);
+      } catch (e) {
+      } finally {
+        if (session === scanSession && sc) sc.scrollTop = prev;
+        if (scanToken === token) scanning = false;
+      }
+    }
+
+    function beginConversation() {
+      session = nextSession();
+      collected.clear();
+      resetMedia();
+      fullScanned = false;
+      scanning = false;
+      scanToken += 1;
+      if (conv) void fullScan();
+      else fullScanned = true;
+    }
+
+    function noteNavigation() {
+      var next = convId();
+      if (next === conv) return;
+      var prev = conv;
+      var had = collected.size;
+      conv = next;
+      if (!prev && next && had > 0) {
+        collected.clear();
+        resetMedia();
+        harvest(specific);
+        fullScanned = true;
+        return;
+      }
+      beginConversation();
+    }
+
+    function plainFallback() {
+      if (collected.size) return;
+      var main = document.querySelector('main') || document.body;
+      var text = main ? (main.innerText || '').replace(/\u00a0/g, ' ').trim() : '';
+      if (text.length < 20) return;
+      collected.set('fallback-main', { role: '', html: '<p>' + esc(text) + '</p>', media: [] });
+    }
+
+    function snapshot() {
+      var items = [];
+      collected.forEach(function (item) {
+        items.push({ role: item.role, html: item.html, media: item.media || [] });
+      });
+      return {
+        session: session,
+        url: location.href,
+        title: document.title || 'ChatGPT',
+        streaming: isStreaming(),
+        scanning: scanning,
+        items: items
+      };
+    }
+
+    window.__ctReset = function () {
+      conv = '';
+      session = nextSession();
+      collected.clear();
+      resetMedia();
+      fullScanned = true;
+      scanning = false;
+      scanToken += 1;
+    };
+
+    window.__ctExport = function () {
+      noteNavigation();
+      if (!scanning && !collected.size) harvest(specific);
+      if (!scanning && !collected.size) harvest(fallback);
+      return snapshot();
+    };
+
+    window.__ctSave = async function () {
+      noteNavigation();
+      resetDebugCitations();
+      collected.clear();
+      resetMedia();
+      scanToken += 1;
+      scanning = false;
+      fullScanned = false;
+      if (convId()) await fullScan();
+      if (!collected.size) harvest(specific);
+      if (!collected.size) harvest(fallback);
+      if (!collected.size) plainFallback();
+      var exported = snapshot();
+      exported.streaming = false;
+      exported.scanning = false;
+      exported.sources = await collectSourcesForSave(collected);
+      var debug = buildPageDebugPayload(exported);
+      if (debug) exported.debug = debug;
+      return exported;
+    };
+
+    var pushState = history.pushState;
+    var replaceState = history.replaceState;
+    history.pushState = function () {
+      var result = pushState.apply(this, arguments);
+      noteNavigation();
+      return result;
+    };
+    history.replaceState = function () {
+      var result = replaceState.apply(this, arguments);
+      noteNavigation();
+      return result;
+    };
+    window.addEventListener('popstate', noteNavigation);
+    var harvestTimer = 0;
+    var observer = new MutationObserver(function () {
+      noteNavigation();
+      if (scanning || harvestTimer) return;
+      harvestTimer = window.setTimeout(function () {
+        harvestTimer = 0;
+        if (!scanning) harvest(specific);
+      }, 200);
+    });
+    observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+    window.setInterval(noteNavigation, 400);
+
+    if (conv) void fullScan();
+    else harvest(specific);
+  }
+
+  function installGemini() {
+    if (window.__ctGeminiReady) return;
+    window.__ctGeminiReady = true;
+
+    var collected = new Map();
+    var session = nextSession();
+    var conv = geminiConvId();
+    var fullScanned = !conv;
+    var scanning = false;
+    var scanToken = 0;
+
+    function geminiConvId() {
+      var match = /\/app\/([^/]+)/.exec(location.pathname || '');
+      return match ? match[1] : '';
+    }
+
+    function harvestGemini() {
+      outermost(queryAllDeep(document, 'user-query, model-response')).forEach(function (el) {
+        var role = el.tagName === 'USER-QUERY' ? 'user' : 'assistant';
+        var message = buildMessage(el, role);
+        if (!message) return;
+        var id = el.getAttribute('id') || el.getAttribute('data-message-id') || '';
+        var key = id || (role + '\n' + plainText(message.html));
+        var previous = collected.get(key);
+        if (!previous || plainText(message.html).length >= plainText(previous.html).length) {
+          collected.set(key, message);
+        }
+      });
+    }
+
+    async function fullScanGemini() {
+      if (fullScanned || !geminiConvId()) return;
+      var token = ++scanToken;
+      var scanSession = session;
+      fullScanned = true;
+      scanning = true;
+      var sc = null;
+      var prev = 0;
+      try {
+        var seed = queryAllDeep(document, 'user-query, model-response')[0] || document.querySelector('main');
+        sc = findScroller(document, seed);
+        prev = sc ? sc.scrollTop : 0;
+        collected.clear();
+        resetMedia();
+        if (sc) {
+          sc.scrollTop = 0;
+          await delay(150);
+          if (session !== scanSession) return;
+          harvestGemini();
+          var stuck = 0;
+          for (var i = 0; i < 60; i++) {
+            if (session !== scanSession) return;
+            var before = sc.scrollTop;
+            var step = Math.max(240, Math.floor(sc.clientHeight * 0.7));
+            sc.scrollTop = before + step;
+            await delay(100);
+            harvestGemini();
+            var atEnd = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 4;
+            if (sc.scrollTop === before) {
+              if (atEnd || ++stuck >= 3) break;
+            } else {
+              stuck = 0;
+            }
+            if (atEnd) break;
+          }
+        } else {
+          harvestGemini();
+        }
+      } catch (e) {
+      } finally {
+        if (session === scanSession && sc) sc.scrollTop = prev;
+        if (scanToken === token) scanning = false;
+      }
+    }
+
+    function snapshot() {
+      var items = [];
+      collected.forEach(function (item) {
+        items.push({ role: item.role, html: item.html, media: item.media || [] });
+      });
+      return {
+        session: session,
+        url: location.href,
+        title: document.title || 'Gemini',
+        streaming: isStreaming(),
+        scanning: scanning,
+        items: items
+      };
+    }
+
+    window.__ctReset = function () {
+      conv = '';
+      session = nextSession();
+      collected.clear();
+      resetMedia();
+      fullScanned = true;
+      scanning = false;
+      scanToken += 1;
+    };
+    window.__ctExport = function () {
+      var next = geminiConvId();
+      if (next !== conv) {
+        conv = next;
+        collected.clear();
+        resetMedia();
+        fullScanned = !next;
+      }
+      if (!scanning && !collected.size) harvestGemini();
+      return snapshot();
+    };
+    window.__ctSave = async function () {
+      resetDebugCitations();
+      collected.clear();
+      resetMedia();
+      scanToken += 1;
+      scanning = false;
+      fullScanned = false;
+      conv = geminiConvId();
+      if (conv) await fullScanGemini();
+      if (!collected.size) harvestGemini();
+      var exported = snapshot();
+      exported.streaming = false;
+      exported.scanning = false;
+      exported.sources = await collectSourcesForSave(collected);
+      var debug = buildPageDebugPayload(exported);
+      if (debug) exported.debug = debug;
+      return exported;
+    };
+
+    var harvestTimer = 0;
+    var observer = new MutationObserver(function () {
+      if (scanning || harvestTimer) return;
+      harvestTimer = window.setTimeout(function () {
+        harvestTimer = 0;
+        if (!scanning) harvestGemini();
+      }, 200);
+    });
+    observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+    if (conv) void fullScanGemini();
+    else harvestGemini();
+  }
+
+  if (location.hostname.indexOf('gemini.google') >= 0) installGemini();
+  else installChatGPT();
+  return 0;
+})();

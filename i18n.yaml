@@ -1,0 +1,148 @@
+# 言語を足す: 下の languages に id を追加し、各キーの下にも同じ id を書く。
+# 無い文言は英語に戻る。編集後はプラグインを再読み込みする。
+languages:
+  en: English
+  ja: 日本語
+
+settings.language.name:
+  en: Language
+  ja: 言語
+settings.language.desc:
+  en: Plugin UI and saved-note labels. ChatGPT/Gemini page detection is unchanged.
+  ja: プラグイン画面と保存ノートの見出しです。ChatGPT / Gemini のページ検出は変わりません。
+settings.folder.name:
+  en: Save folder
+  ja: 保存フォルダ
+settings.folder.desc:
+  en: Vault-relative path. Missing folders are created on save.
+  ja: Vault 内の相対パスです。無いフォルダは保存時に作ります。
+settings.filename.name:
+  en: Filename
+  ja: ファイル名
+settings.filename.desc:
+  en: ".md / .pdf is added from the save format. Dates use {{date:YYMMDD_HHmmss}}. Tokens: YY, YYYY, MM, DD, HH, mm, ss."
+  ja: 拡張子 .md / .pdf は保存形式に応じて自動で付きます。日付は {{date:YYMMDD_HHmmss}} の形式です。使える記号は YY、YYYY、MM、DD、HH、mm、ss です。
+settings.debug.name:
+  en: Enable citation debug
+  ja: 引用デバッグを有効にする
+settings.debug.desc:
+  en: Also save a diagnostic JSON (*.debug.json) next to ChatGPT/Gemini notes. Turn this off for daily use.
+  ja: ChatGPT / Gemini の保存時に、同じフォルダへ診断用 JSON（*.debug.json）を追加保存します。修正依頼用です。普段はオフにしてください。
+
+command.open:
+  en: Open ChatTaker
+  ja: ChatTaker を開く
+
+view.newChat:
+  en: New chat
+  ja: 新規チャット
+view.save:
+  en: Save chat
+  ja: チャットを保存
+view.saving:
+  en: Saving...
+  ja: 保存中...
+view.saveFailed:
+  en: "Could not save the chat. {message}"
+  ja: "チャットを保存できませんでした。{message}"
+view.saveFailedStatus:
+  en: Save failed
+  ja: 保存に失敗しました
+view.nothingToSave:
+  en: Nothing to save.
+  ja: 保存できる会話がありません。
+view.nothingToSaveStatus:
+  en: Nothing to save
+  ja: 保存できる会話がありません
+view.savingImages:
+  en: Saving images...
+  ja: 画像を保存中...
+view.loadingImages:
+  en: Loading images...
+  ja: 画像を取得中...
+view.makingPdf:
+  en: Creating PDF...
+  ja: PDF を作成中...
+view.saved:
+  en: "Saved.\n{path}{extra}{debug}"
+  ja: "保存しました。\n{path}{extra}{debug}"
+view.savedStatus:
+  en: "Saved: {name}{extra}"
+  ja: "保存しました: {name}{extra}"
+view.savedPdf:
+  en: "Saved PDF.\n{path}{extra}{debug}"
+  ja: "PDF を保存しました。\n{path}{extra}{debug}"
+view.debug:
+  en: "\nDebug: {path}"
+  ja: "\n診断: {path}"
+view.imagesExtra:
+  en: " ({saved} images{failed})"
+  ja: "（画像 {saved} 件{failed}）"
+view.imagesFailed:
+  en: ", {failed} failed"
+  ja: "、失敗 {failed}"
+view.newChatStatus:
+  en: New chat
+  ja: 新しいチャット
+view.folderCollision:
+  en: "Save path collides with a file: {path}"
+  ja: "保存先がファイルと衝突しています: {path}"
+
+pdf.saved:
+  en: "Saved: {datetime}"
+  ja: "保存: {datetime}"
+pdf.source:
+  en: "Source: {url}"
+  ja: "出典: {url}"
+pdf.question:
+  en: Question
+  ja: Question
+pdf.refs:
+  en: References
+  ja: 参照
+pdf.lang:
+  en: en
+  ja: ja
+
+refs.heading:
+  en: "## References"
+  ja: "## 参照"
+
+media.rebuiltMap:
+  en: Reconstructed map
+  ja: 再構成地図
+media.openOriginal:
+  en: Open original map
+  ja: 元の地図を開く
+
+map.title:
+  en: Reconstructed map
+  ja: 再構成地図
+map.intro:
+  en: This page was rebuilt from coordinates and URLs captured at save time. It is not a full copy of the original map service.
+  ja: このページは保存時に取得できた座標・URL から再構成したものです。元の地図サービスそのものの完全保存ではありません。
+map.openOriginal:
+  en: Open original map
+  ja: 元の地図を開く
+map.iframeTitle:
+  en: Reconstructed map
+  ja: 再構成地図
+map.noCoords:
+  en: Not enough coordinates to embed map tiles.
+  ja: 埋め込み用の座標が足りないため、地図タイルは表示できません。
+map.openOriginalBrowser:
+  en: Open the original map in a browser
+  ja: 元の地図をブラウザで開く
+map.queryOnly:
+  en: Only a search query was captured.
+  ja: 検索語のみ取得できました。
+map.searchOsm:
+  en: Search on OpenStreetMap
+  ja: OpenStreetMap で検索
+
+pdf.empty:
+  en: PDF data is empty
+  ja: PDF データが空です
+pdf.timeout:
+  en: Timed out loading the print page
+  ja: PDF 用ページの読み込みがタイムアウトしました

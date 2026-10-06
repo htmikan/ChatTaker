@@ -1,0 +1,79 @@
+.workspace-leaf-content[data-type="chattaker-view"] .view-content {
+  padding: 0;
+}
+
+.chattaker-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0;
+}
+
+.chattaker-site {
+  flex: 0 0 auto;
+}
+
+.chattaker-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.chattaker-save-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.chattaker-save-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 140px;
+  padding: 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-primary);
+  box-shadow: var(--shadow-s);
+}
+
+.chattaker-save-menu button {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 6px 10px;
+  text-align: left;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-normal);
+  cursor: pointer;
+}
+
+.chattaker-save-menu button:hover,
+.chattaker-save-menu button.is-preferred {
+  background: var(--background-modifier-hover);
+}
+
+.chattaker-status {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chattaker-webview {
+  display: flex;
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: 0;
+}

@@ -1,0 +1,10 @@
+node_modules
+.hotreload
+*.map
+obsidian_vault/
+.cursor/
+.env
+.env.*
+*.pem
+*.key
+data.json

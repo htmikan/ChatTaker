@@ -1,0 +1,10 @@
+{
+  "id": "chattaker",
+  "name": "ChatTaker",
+  "version": "1.0.0",
+  "minAppVersion": "1.5.0",
+  "description": "Saves your ChatGPT and Gemini conversation history to your vault.",
+  "author": "htmikan",
+  "authorUrl": "https://github.com/htmikan",
+  "isDesktopOnly": true
+}
