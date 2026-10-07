@@ -46,7 +46,8 @@ export default class ChatTakerPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const saved = (await this.loadData()) as Partial<ChatTakerSettings> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved ?? {});
     this.settings.lastSaveFormat = asSaveFormat(this.settings.lastSaveFormat);
     this.settings.debugCitations = Boolean(this.settings.debugCitations);
     this.settings.language = asUiLanguage(this.settings.language);

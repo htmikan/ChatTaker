@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 const outfile = path.resolve("selfcheck.cjs");
 
 await esbuild.build({
-  entryPoints: ["src/selfcheck.ts"],
+  entryPoints: ["scripts/selfcheck.ts"],
   bundle: true,
   platform: "node",
   format: "cjs",

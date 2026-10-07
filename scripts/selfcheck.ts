@@ -4,15 +4,15 @@
  * Not shipped inside the Obsidian plugin bundle.
  */
 import assert from "node:assert/strict";
-import { asCollectedChat, collectScript } from "./collect";
-import { buildCitationDebugDump } from "./debug";
-import { conversationId, formatDatePattern, filenameTemplateFor, normalizeFolder, renderFilename, siteFilenameTemplate, withUniqueSuffix } from "./filename";
-import { asUiLanguage, languageOptions, loadI18nYaml, setLanguage, t } from "./i18n";
-import { buildMapHtml, canBuildMapHtml } from "./map";
-import { buildNote, formatSavedAt, formatSourcesMarkdown, formatObsidianMath, htmlToMarkdown } from "./markdown";
-import { buildPrintHtml } from "./pdf";
-import { enhancePlaceLinks, mapsSearchUrl } from "./places";
-import { PLUGIN_ICON_ID, PLUGIN_ICON_SVG } from "./icon";
+import { asCollectedChat, collectScript } from "../src/collect";
+import { buildCitationDebugDump } from "../src/debug";
+import { conversationId, formatDatePattern, filenameTemplateFor, normalizeFolder, renderFilename, siteFilenameTemplate, withUniqueSuffix } from "../src/filename";
+import { asUiLanguage, languageOptions, loadI18nYaml, setLanguage, t } from "../src/i18n";
+import { buildMapHtml, canBuildMapHtml } from "../src/map";
+import { buildNote, formatSavedAt, formatSourcesMarkdown, formatObsidianMath, htmlToMarkdown } from "../src/markdown";
+import { buildPrintHtml } from "../src/pdf";
+import { enhancePlaceLinks, mapsSearchUrl } from "../src/places";
+import { PLUGIN_ICON_ID, PLUGIN_ICON_SVG } from "../src/icon";
 
 assert.equal(PLUGIN_ICON_ID, "chattaker");
 assert.match(PLUGIN_ICON_SVG, /currentColor/);

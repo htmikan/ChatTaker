@@ -1,6 +1,9 @@
 /**
  * Plugin settings model and the Obsidian settings tab UI
  * (save folder, filename template, language, citation debug).
+ *
+ * Obsidian 1.13+ uses getSettingDefinitions() for settings search;
+ * display() remains as a fallback for older app versions.
  */
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type ChatTakerPlugin from "./main";
@@ -36,6 +39,62 @@ export class ChatTakerSettingTab extends PluginSettingTab {
     super(app, plugin);
   }
 
+  /**
+   * Declarative settings for Obsidian 1.13+ (indexed by settings search).
+   * Language uses `render` because changing it must refresh open views.
+   */
+  getSettingDefinitions() {
+    return [
+      {
+        name: t("settings.language.name"),
+        desc: t("settings.language.desc"),
+        // Side effect: apply language to open ChatTaker views immediately.
+        render: (setting: Setting) => {
+          setting.addDropdown((dropdown) => {
+            for (const option of languageOptions()) dropdown.addOption(option.id, option.label);
+            dropdown.setValue(this.plugin.settings.language);
+            dropdown.onChange(async (value) => {
+              this.plugin.settings.language = asUiLanguage(value);
+              setLanguage(this.plugin.settings.language);
+              await this.plugin.saveSettings();
+              this.plugin.applyLanguage();
+            });
+          });
+        },
+      },
+      {
+        name: t("settings.folder.name"),
+        desc: t("settings.folder.desc"),
+        control: {
+          type: "text" as const,
+          key: "folder",
+          placeholder: DEFAULT_SETTINGS.folder,
+          defaultValue: DEFAULT_SETTINGS.folder,
+        },
+      },
+      {
+        name: t("settings.filename.name"),
+        desc: t("settings.filename.desc"),
+        control: {
+          type: "text" as const,
+          key: "filenameTemplate",
+          placeholder: DEFAULT_SETTINGS.filenameTemplate,
+          defaultValue: DEFAULT_SETTINGS.filenameTemplate,
+        },
+      },
+      {
+        name: t("settings.debug.name"),
+        desc: t("settings.debug.desc"),
+        control: {
+          type: "toggle" as const,
+          key: "debugCitations",
+          defaultValue: false,
+        },
+      },
+    ];
+  }
+
+  /** Fallback for Obsidian < 1.13.0 (imperative settings UI). */
   display(): void {
     const { containerEl } = this;
     containerEl.empty();

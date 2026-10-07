@@ -23,6 +23,7 @@ import { buildPrintHtml, saveChatPdfFromHtml } from "./pdf";
 import { asSaveFormat, DEFAULT_SETTINGS, type SaveFormat } from "./settings";
 import { buildCitationDebugDump, writeCitationDebugDump } from "./debug";
 import { t } from "./i18n";
+import { createWebviewEl } from "./webview";
 
 export const VIEW_TYPE_CHATTAKER = "chattaker-view";
 
@@ -187,13 +188,14 @@ export class ChatTakerView extends ItemView {
       this.webview.remove();
       this.webview = null;
     }
-    // Electron <webview> is not in HTMLElementTagNameMap; createEl typing rejects the tag name.
-    const webview = this.contentEl.ownerDocument.createElement("webview") as ChatWebview;
-    webview.classList.add("chattaker-webview");
-    webview.setAttribute("partition", sitePartition(this.site));
-    webview.setAttribute("allowpopups", "true");
-    webview.setAttribute("useragent", chromeUserAgent());
-    this.contentEl.appendChild(webview);
+    const webview = createWebviewEl(this.contentEl, {
+      cls: "chattaker-webview",
+      attr: {
+        partition: sitePartition(this.site),
+        allowpopups: "true",
+        useragent: chromeUserAgent(),
+      },
+    }) as ChatWebview;
     webview.addEventListener("dom-ready", () => {
       void this.inject();
     });

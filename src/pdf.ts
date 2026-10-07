@@ -7,6 +7,7 @@ import { collectSources } from "./footnotes";
 import { prepareMessages, formatSavedAt, replaceSourceLinksInHtml, expandMathInHtml } from "./markdown";
 import type { ChatSite } from "./filename";
 import { t } from "./i18n";
+import { createWebviewEl } from "./webview";
 
 export interface PdfWebview extends HTMLElement {
   src: string;
@@ -158,11 +159,10 @@ export async function saveChatPdfFromHtml(
 ): Promise<string> {
   await ensureFolder(app, folder);
   const path = uniquePath(app, folder, `${basename}.pdf`);
-  // Electron <webview> is not in HTMLElementTagNameMap; createEl typing rejects the tag name.
-  const webview = host.ownerDocument.createElement("webview") as PdfWebview;
-  webview.classList.add("chattaker-print-webview");
-  webview.setAttribute("partition", "persist:chattaker-print");
-  host.appendChild(webview);
+  const webview = createWebviewEl(host, {
+    cls: "chattaker-print-webview",
+    attr: { partition: "persist:chattaker-print" },
+  }) as PdfWebview;
 
   try {
     await loadBlank(webview);
