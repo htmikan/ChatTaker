@@ -7,6 +7,14 @@ import { buildMapHtml, canBuildMapHtml } from "./map";
 import { buildNote, formatSavedAt, formatSourcesMarkdown, formatObsidianMath, htmlToMarkdown } from "./markdown";
 import { buildPrintHtml } from "./pdf";
 import { enhancePlaceLinks, mapsSearchUrl } from "./places";
+import { PLUGIN_ICON_ID, PLUGIN_ICON_SVG } from "./icon";
+
+assert.equal(PLUGIN_ICON_ID, "chattaker");
+assert.match(PLUGIN_ICON_SVG, /currentColor/);
+assert.match(PLUGIN_ICON_SVG, /scale\(/);
+assert.match(PLUGIN_ICON_SVG, /translate\(/);
+assert.equal(PLUGIN_ICON_SVG.includes("<svg"), false);
+assert.equal(PLUGIN_ICON_SVG.includes("#000"), false);
 
 const date = new Date(2026, 9, 2, 15, 8, 44);
 assert.equal(formatDatePattern(date, "YYMMDD_HHmmss"), "261002_150844");
