@@ -1,3 +1,7 @@
+/**
+ * Plugin settings model and the Obsidian settings tab UI
+ * (save folder, filename template, language, citation debug).
+ */
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type ChatTakerPlugin from "./main";
 import { DEFAULT_FILENAME_TEMPLATE } from "./filename";
@@ -9,7 +13,7 @@ export interface ChatTakerSettings {
   folder: string;
   filenameTemplate: string;
   lastSaveFormat: SaveFormat;
-  /** 保存時に引用診断 JSON を追加保存する */
+  /** When true, also write a *.debug.json citation dump next to the note. */
   debugCitations: boolean;
   language: UiLanguage;
 }
@@ -26,6 +30,7 @@ export function asSaveFormat(value: unknown): SaveFormat {
   return value === "pdf" ? "pdf" : "markdown";
 }
 
+/** Settings → ChatTaker panel. */
 export class ChatTakerSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: ChatTakerPlugin) {
     super(app, plugin);

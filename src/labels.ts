@@ -1,5 +1,9 @@
-/** Gemini / ChatGPT の UI ラベルを本文から除く */
+/**
+ * Strip ChatGPT / Gemini chrome labels ("Your prompt", "Gemini's response", …)
+ * so they do not appear as note content.
+ */
 
+/** Remove UI label blocks from message HTML. */
 export function stripResponseLabelsHtml(html: string): string {
   return dedupeAdjacentParagraphs(
     html.replace(/<(p|h[1-6]|div|span|header)(\s[^>]*)?>([\s\S]*?)<\/\1>/gi, (all, tag: string, _attrs: string, inner: string) => {
@@ -13,6 +17,7 @@ export function stripResponseLabelsHtml(html: string): string {
   );
 }
 
+/** Remove leftover prompt-label lines from Markdown (user callout body). */
 export function stripPromptFromMarkdown(markdown: string): string {
   const lines = markdown.split(/\r?\n/).flatMap((line) => {
     const cleaned = collapseDuplicatedPhrase(

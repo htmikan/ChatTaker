@@ -1,14 +1,15 @@
+/**
+ * Ribbon / tab icon for ChatTaker.
+ * Source artwork: ChatTaker_icon.svg (1024×1024). Scaled into Obsidian's 100×100 addIcon space.
+ */
 export const PLUGIN_ICON_ID = "chattaker";
 
-/**
- * ChatTaker_icon.svg（viewBox 0 0 1024 1024）を Obsidian addIcon 用に変換。
- * 実描画の bbox ≒ (272,276)–(812,852) を 100×100 にほぼいっぱいに収める。
- * stroke はテーマ追従のため currentColor。
- */
-const ICON_SCALE = (100 - 8) / 576; // ≈ 0.159722 — 高さ基準、上下に約 4 の余白
+/** Scale/translate so the drawn bbox fills most of the 100×100 viewBox; stroke uses currentColor. */
+const ICON_SCALE = (100 - 8) / 576; // ≈ 0.159722 — height-based, ~4px padding top/bottom
 const ICON_TX = (100 - 540 * ICON_SCALE) / 2 - 272 * ICON_SCALE;
 const ICON_TY = (100 - 576 * ICON_SCALE) / 2 - 276 * ICON_SCALE;
 
+/** SVG fragment passed to addIcon (no outer <svg>; host supplies viewBox 0 0 100 100). */
 export const PLUGIN_ICON_SVG =
   `<g transform="translate(${ICON_TX} ${ICON_TY}) scale(${ICON_SCALE})" fill="none" stroke="currentColor" stroke-width="48" stroke-linecap="round" stroke-linejoin="round">` +
   '<path d="M344 760 C302 748 272 708 272 660 V398 C272 330 326 276 394 276 H690 C758 276 812 330 812 398 V514"/>' +

@@ -1,3 +1,8 @@
+/**
+ * Offline regression checks run by `npm run check` (via scripts/selfcheck.mjs).
+ * Covers filename helpers, footnotes, place links, maps, i18n, and sample notes.
+ * Not shipped inside the Obsidian plugin bundle.
+ */
 import assert from "node:assert/strict";
 import { asCollectedChat, collectScript } from "./collect";
 import { buildCitationDebugDump } from "./debug";

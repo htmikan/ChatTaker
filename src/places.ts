@@ -1,10 +1,17 @@
-/** Google Maps URLs API（検索）— 店舗名からマップを開く */
+/**
+ * Turn Gemini / ChatGPT place cards into Google Maps search links
+ * (https://www.google.com/maps/search/?api=1&query=...).
+ * Used as a Markdown post-process when the DOM had no real href.
+ */
+
+/** Build a Google Maps URLs API search link from a place name. */
 export function mapsSearchUrl(query: string): string {
   const q = query.trim();
   if (!q) return "";
   return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}`;
 }
 
+/** True when the URL is already a Maps search API link (should stay as a body link). */
 export function isMapsSearchUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
@@ -19,6 +26,7 @@ export function isMapsSearchUrl(url: string): boolean {
   }
 }
 
+/** Bold linked place name plus optional rating / category line. */
 function placeLinkMarkdown(name: string, rating?: string, meta?: string): string {
   const url = mapsSearchUrl(name);
   const bits = [rating, meta].map((s) => String(s || "").replace(/\s+/g, " ").trim()).filter(Boolean);
@@ -27,8 +35,8 @@ function placeLinkMarkdown(name: string, rating?: string, meta?: string): string
 }
 
 /**
- * Gemini / ChatGPT の店舗カードを検出し、店名を Maps 検索リンクにする。
- * DOM で取りこぼしたプレーンテキスト向けの後処理。
+ * Detect place-card text patterns and convert store names to Maps links.
+ * Handles Gemini ("stars rating" / side-panel chrome) and ChatGPT ("★ rating•category").
  */
 export function enhancePlaceLinks(markdown: string): string {
   if (!markdown) return markdown;
@@ -56,6 +64,7 @@ export function enhancePlaceLinks(markdown: string): string {
     },
   );
 
+  // Gemini inline mention before the side-panel hint string
   result = result.replace(
     /([^\n[\]]{2,80}?)クリックするとサイドパネルが開き、詳細が表示されます/g,
     (_all, prefix: string) => {
@@ -70,10 +79,10 @@ export function enhancePlaceLinks(markdown: string): string {
     },
   );
 
-  // ChatGPT: 地図ピン由来の先頭評価 ★3.5**店名**…
+  // ChatGPT: pin rating glued before a bold name (map legend noise)
   result = result.replace(/★\s*\d(?:\.\d)?\s*(?=\*\*[^*\n]+\*\*\s*★)/g, "");
 
-  // ChatGPT: **店名**★ 3.5•カテゴリ / **店名**★ 3.5 · カテゴリ（地図下で連結される場合あり）
+  // ChatGPT: **Name**★ 3.5•category (may be concatenated under the map image)
   result = result.replace(
     /\*\*([^*[\]\n]{2,80}?)\*\*\s*★\s*(\d(?:\.\d)?)\s*[·•]\s*([^\n★*]{0,80})/g,
     (all, rawName: string, rating: string, category: string) => {
@@ -84,7 +93,7 @@ export function enhancePlaceLinks(markdown: string): string {
     },
   );
 
-  // ChatGPT: 太字なし 店名★ 3.5•カテゴリ（行頭）
+  // ChatGPT: plain Name★ 3.5•category at line start
   result = result.replace(
     /(^|\n)([^\n[\]*]{2,80}?)\s*★\s*(\d(?:\.\d)?)\s*[·•]\s*([^\n★]{0,80})/g,
     (all, lead: string, rawName: string, rating: string, category: string) => {

@@ -1,3 +1,7 @@
+/**
+ * Download chat images / screenshots / map captures into the vault attachments folder.
+ * Optionally write a reconstructed OpenStreetMap HTML companion for map media.
+ */
 import type { App } from "obsidian";
 import type { CollectedChat, CollectedMedia } from "./collect";
 import { buildMapHtml, canBuildMapHtml } from "./map";
@@ -50,6 +54,7 @@ export interface MediaDataResult {
   failed: number;
 }
 
+/** Persist every CollectedMedia item; returns vault paths and success counts. */
 export async function saveCollectedMedia(
   app: App,
   webview: MediaWebview,
@@ -94,6 +99,7 @@ export async function saveCollectedMedia(
   return { paths, extras, saved, failed };
 }
 
+/** Load media as data URLs for in-memory PDF printing (no vault writes). */
 export async function loadCollectedMediaData(
   webview: MediaWebview,
   chat: CollectedChat,

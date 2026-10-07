@@ -1,3 +1,7 @@
+/**
+ * Sidebar ItemView that embeds ChatGPT / Gemini in an Electron <webview>
+ * and saves the current conversation as Markdown or PDF into the vault.
+ */
 import { ItemView, Notice, Platform, TFolder, Vault, WorkspaceLeaf } from "obsidian";
 import type ChatTakerPlugin from "./main";
 import { PLUGIN_ICON_ID } from "./icon";
@@ -32,6 +36,7 @@ interface ChatWebview extends HTMLElement, MediaWebview {
 }
 
 export class ChatTakerView extends ItemView {
+  /** Live Electron webview for the selected chat site. */
   private webview: ChatWebview | null = null;
   private statusEl: HTMLElement | null = null;
   private saveButton: HTMLButtonElement | null = null;
@@ -176,6 +181,7 @@ export class ChatTakerView extends ItemView {
     }
   }
 
+  /** Create / replace the site webview with a desktop Chrome user-agent. */
   private mountWebview(url: string): void {
     if (this.webview) {
       this.webview.remove();
@@ -203,6 +209,7 @@ export class ChatTakerView extends ItemView {
     this.setStatus(site === "gemini" ? "Gemini" : "ChatGPT");
   }
 
+  /** Inject collect-page.txt into the webview so Save can harvest the DOM. */
   private async inject(): Promise<void> {
     if (!this.webview) return;
     try {
@@ -217,6 +224,7 @@ export class ChatTakerView extends ItemView {
     if (this.saveButton && !this.saveButton.disabled) this.saveButton.setText(t("view.save"));
   }
 
+  /** Save the current chat as Markdown or PDF (shared UI lock / notices). */
   private async saveAs(format: SaveFormat): Promise<void> {
     if (!this.webview || !this.saveButton || this.saveButton.disabled) return;
     const button = this.saveButton;
@@ -242,6 +250,7 @@ export class ChatTakerView extends ItemView {
     }
   }
 
+  /** Collect chat HTML, download media, write a vault note (+ optional debug JSON). */
   private async saveMarkdown(): Promise<void> {
     if (!this.webview) return;
     const data = await this.collectForSave();
@@ -289,6 +298,7 @@ export class ChatTakerView extends ItemView {
     this.setStatus(t("view.savedStatus", { name: file.basename, extra }));
   }
 
+  /** Collect chat HTML and print it to a PDF via a hidden webview. */
   private async savePdf(): Promise<void> {
     if (!this.webview) return;
     const data = await this.collectForSave();
@@ -344,6 +354,7 @@ export class ChatTakerView extends ItemView {
     this.setStatus(t("view.savedStatus", { name: `${basename}.pdf`, extra }));
   }
 
+  /** Optionally write *.debug.json beside the saved note when citation debug is on. */
   private async writeDebugIfEnabled(input: {
     site: ChatSite;
     format: SaveFormat;
@@ -364,6 +375,7 @@ export class ChatTakerView extends ItemView {
     return writeCitationDebugDump(this.app.vault, input.folder, input.basename, dump);
   }
 
+  /** Ask the injected page script for the current conversation payload. */
   private async collectForSave(): Promise<CollectedChat | null> {
     const webview = this.webview;
     if (!webview) return null;
@@ -379,6 +391,7 @@ export class ChatTakerView extends ItemView {
     return asCollectedChat(raw);
   }
 
+  /** Build a unique note basename from the configured filename template. */
   private nextBasename(folder: string, date: Date, site: ChatSite, ext: "md" | "pdf"): string {
     const template = filenameTemplateFor(site, this.plugin.settings.filenameTemplate || DEFAULT_SETTINGS.filenameTemplate);
     const base = renderFilename(template, date);
@@ -408,6 +421,7 @@ export class ChatTakerView extends ItemView {
   }
 }
 
+/** Create each path segment under the vault if missing. */
 async function ensureFolder(vault: Vault, folder: string): Promise<void> {
   const parts = folder.split("/").filter((part) => part.length > 0);
   let current = "";
@@ -426,6 +440,7 @@ function mediaExtra(saved: number, failed: number): string {
   return t("view.imagesExtra", { saved, failed: failedPart });
 }
 
+/** Spoof a normal desktop Chrome UA so chat sites do not treat Obsidian as mobile. */
 function chromeUserAgent(): string {
   if (Platform.isMacOS) {
     return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";

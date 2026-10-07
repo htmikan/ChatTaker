@@ -1,3 +1,8 @@
+/**
+ * Plugin entry point.
+ * Registers the ChatTaker sidebar view, ribbon icon, command, and settings tab.
+ * Does not detach leaves on unload so the user's layout is preserved.
+ */
 import { normalizePath, Plugin, WorkspaceLeaf, addIcon } from "obsidian";
 import { PLUGIN_ICON_ID, PLUGIN_ICON_SVG } from "./icon";
 import { asUiLanguage, loadI18nYaml, setLanguage, t } from "./i18n";
@@ -25,6 +30,7 @@ export default class ChatTakerPlugin extends Plugin {
     this.addSettingTab(new ChatTakerSettingTab(this.app, this));
   }
 
+  /** Load optional plugin-folder i18n.yaml overlay (bundled strings stay as fallback). */
   private async loadI18n(): Promise<void> {
     const dir = this.manifest.dir;
     if (!dir) return;
@@ -51,6 +57,7 @@ export default class ChatTakerPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  /** Push the active UI language into open ChatTaker views. */
   applyLanguage(): void {
     setLanguage(this.settings.language);
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_CHATTAKER)) {
@@ -59,6 +66,7 @@ export default class ChatTakerPlugin extends Plugin {
     }
   }
 
+  /** Open or focus the ChatTaker leaf in the right sidebar. */
   async activateView(): Promise<void> {
     const { workspace } = this.app;
     let leaf: WorkspaceLeaf | null = workspace.getLeavesOfType(VIEW_TYPE_CHATTAKER)[0] ?? null;

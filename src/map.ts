@@ -1,3 +1,7 @@
+/**
+ * Rebuild a simple OpenStreetMap HTML page for ChatGPT map captures
+ * when we know coordinates and/or an original map URL.
+ */
 import type { CollectedMedia, MapState } from "./collect";
 import { t } from "./i18n";
 
@@ -11,6 +15,7 @@ export function hasMapCoordinates(state?: MapState): boolean {
   );
 }
 
+/** Whether we have enough info to write a companion .html for this map media. */
 export function canBuildMapHtml(media: CollectedMedia): boolean {
   if (media.kind !== "map") return false;
   if (media.sourceUrl && /^https?:\/\//i.test(media.sourceUrl)) return true;
@@ -19,6 +24,7 @@ export function canBuildMapHtml(media: CollectedMedia): boolean {
   return false;
 }
 
+/** HTML document with OSM embed + link back to the original map when available. */
 export function buildMapHtml(media: CollectedMedia): string | null {
   if (!canBuildMapHtml(media)) return null;
   const sourceUrl = media.sourceUrl && /^https?:\/\//i.test(media.sourceUrl) ? media.sourceUrl : "";

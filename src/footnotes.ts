@@ -1,10 +1,14 @@
+/**
+ * Convert inline source links into Obsidian footnotes [^N] and build a reference list.
+ * Keeps Maps search links and standalone homepage cards as normal Markdown links.
+ */
 import type { CollectedMessage, CollectedSource } from "./collect";
 import { t } from "./i18n";
 
 const SOURCE_CHROME_TAGS =
   "sources-carousel-inline|sources-carousel|structured-sources-block|sources-sidebar|sidebar-sources|model-thoughts|thoughts-animation";
 
-/** 本文中の URL / リンクを脚注 [^N] にし、参照一覧を育てる。URL は捨てない。 */
+/** Merge page-collected sources with URLs discovered in message HTML. */
 export function collectSources(base: CollectedSource[], messages: CollectedMessage[]): CollectedSource[] {
   const sources: CollectedSource[] = [];
   for (const item of base) {
@@ -16,6 +20,7 @@ export function collectSources(base: CollectedSource[], messages: CollectedMessa
   return sources;
 }
 
+/** Replace cite chips / anchors in HTML with <span data-ct-fn="N"> markers. */
 export function applyFootnoteMarkers(html: string, sources: CollectedSource[]): string {
   if (!html) return html;
   let result = markStandaloneAnchors(stripSourceChrome(html));
@@ -65,6 +70,7 @@ export function applyFootnoteMarkers(html: string, sources: CollectedSource[]): 
   return replaceBareUrlsInHtml(result, sources);
 }
 
+/** Turn Markdown links into footnotes, except keep-link / Maps search URLs. */
 export function replaceSourceLinksInMarkdown(markdown: string, sources: CollectedSource[]): string {
   const replaced = markdown.replace(/\[([^\]]*)\]\((https?:[^)\s]+)(?:\s+"[^"]*")?\)/g, (all, text: string, url: string, offset: number, full: string) => {
     if (isStandaloneMarkdownLinkLine(full, offset, all.length)) return all;
@@ -116,6 +122,7 @@ function markStandaloneAnchors(html: string): string {
   return result;
 }
 
+/** HTML variant used when building printable PDF content. */
 export function replaceSourceLinksInHtml(html: string, sources: CollectedSource[]): string {
   return applyFootnoteMarkers(html, sources).replace(/<span\b([^>]*)>([\s\S]*?)<\/span>/gi, (all, attrs: string) => {
     const fn = /\bdata-ct-fn\s*=\s*"(\d+)"/i.exec(attrs) || /\bdata-ct-fn\s*=\s*'(\d+)'/i.exec(attrs);
@@ -123,6 +130,7 @@ export function replaceSourceLinksInHtml(html: string, sources: CollectedSource[
   });
 }
 
+/** Render the trailing "## References" footnote definition block. */
 export function formatSourcesMarkdown(sources: CollectedSource[]): string {
   if (!sources.length) return "";
   const lines = sources.map((source, index) => {

@@ -1,3 +1,7 @@
+/**
+ * Lightweight i18n: bundled i18n.yaml plus optional plugin-folder overlay.
+ * `t(key)` resolves UI / note strings for the active language.
+ */
 import yamlText from "../i18n.yaml";
 
 /** Language id from i18n.yaml `languages:` (en, ja, fr, zh-CN, …). */
@@ -51,6 +55,7 @@ export function loadI18nYaml(source: string): void {
   };
 }
 
+/** Translate a key; falls back to English, then to the key itself. Supports `{name}` vars. */
 export function t(key: string, vars?: Record<string, string | number>): string {
   const entry = catalog.strings[key];
   const raw = (entry && (entry[current] || entry[FALLBACK])) || key;

@@ -1,3 +1,6 @@
+/**
+ * Build printable HTML for a chat and render it to PDF via a hidden Electron webview.
+ */
 import type { App } from "obsidian";
 import type { CollectedMessage, CollectedSource } from "./collect";
 import { collectSources } from "./footnotes";
@@ -15,6 +18,7 @@ export interface PdfWebview extends HTMLElement {
   }): Promise<Uint8Array | ArrayBuffer>;
 }
 
+/** Standalone HTML document suitable for webview.printToPDF. */
 export function buildPrintHtml(input: {
   site: ChatSite;
   source: string;
@@ -144,6 +148,7 @@ function formatSourcesHtml(sources: CollectedSource[]): string {
   return `<section class="refs"><h2>${escapeHtml(t("pdf.refs"))}</h2>${items}</section>`;
 }
 
+/** Write HTML into an off-screen webview, print to PDF, save under folder/basename.pdf. */
 export async function saveChatPdfFromHtml(
   app: App,
   host: HTMLElement,

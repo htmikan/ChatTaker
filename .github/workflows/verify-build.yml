@@ -1,0 +1,24 @@
+# Clean install + build from the committed lockfile (same path Obsidian reviewers expect).
+name: Verify build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck, build, and selfcheck
+        run: npm run check

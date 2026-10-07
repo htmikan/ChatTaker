@@ -1,3 +1,16 @@
+/**
+ * ChatTaker page script — injected into the ChatGPT / Gemini webview.
+ *
+ * Responsibilities:
+ * - Walk the conversation DOM and sanitize it to simple HTML
+ * - Resolve citation pills / jslog / sources payloads into real URLs
+ * - Register images, map widgets, and screenshot captures as media
+ * - Detect place cards and emit Maps search links when possible
+ * - Expose window.__ctCollect() so the Obsidian side can pull a payload
+ *
+ * This file is loaded as a string (collect-page.txt) and executed via
+ * webview.executeJavaScript — it is not a Node/TypeScript module.
+ */
 (function () {
   if (window.__ctInstalled) {
     if (location.hostname.indexOf('gemini.google') >= 0) installGemini();
@@ -10,6 +23,8 @@
   var mediaMeta = new Map();
   var mediaSeq = 0;
   var debugCitationRecords = [];
+
+  // --- Citation debug (optional sidecar JSON) ---
 
   function debugCitationsEnabled() {
     return Boolean(window.__ctDebugCitations);
@@ -88,6 +103,8 @@
   function delay(ms) {
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
+
+  // --- DOM helpers (shadow roots, outermost nodes, URL cleanup) ---
 
   function queryAllDeep(root, selector) {
     var found = [];
@@ -247,6 +264,8 @@
     }
     return false;
   }
+
+  // --- Citations / sources: pills, jslog, payloads, noise filtering ---
 
   function isCitationPill(node) {
     if (!node || node.nodeType !== 1) return false;
@@ -740,6 +759,8 @@
     return sources;
   }
 
+  // --- Math (KaTeX / MathML → data-ct-math markers) ---
+
   function languageOf(node) {
     if (!node || !node.getAttribute) return '';
     var className = typeof node.className === 'string' ? node.className : '';
@@ -839,6 +860,8 @@
     return formatMathHtml(isDisplayMath(node), latex);
   }
 
+  // --- UI chrome stripping (prompt/response labels, action buttons) ---
+
   function isActionControl(node) {
     var label = ((node.getAttribute('aria-label') || '') + ' ' + (node.getAttribute('data-testid') || '')).toLowerCase();
     return /copy|share|edit|regenerate|thumbs|more|menu|good|bad|コピー|共有|編集|再生成|その他/.test(label);
@@ -935,6 +958,8 @@
   }
 
   var captureClaimed = new Set();
+
+  // --- Media: images, map widgets, screenshot captures ---
 
   function resetMedia() {
     mediaElements.clear();
@@ -1133,6 +1158,8 @@
     return false;
   }
 
+  // --- Place cards → Google Maps search links ---
+
   function mapsSearchUrl(query) {
     var q = String(query || '').trim();
     if (!q) return '';
@@ -1233,6 +1260,8 @@
     html += '</p>';
     return html;
   }
+
+  // --- HTML sanitize / message build ---
 
   function sanitize(node, inList) {
     if (!node) return '';
@@ -1497,6 +1526,8 @@
     if (width < 8 || height < 8) return null;
     return { x: x, y: y, width: width, height: height };
   };
+
+  // --- Site installers: observe the conversation and export via __ctCollect ---
 
   function installChatGPT() {
     if (window.__ctChatReady) return;

@@ -1,3 +1,7 @@
+/**
+ * Types and helpers for chat payloads returned by the injected page script.
+ * `collectScript` is the raw JS source of collect-page.txt (injected into the webview).
+ */
 import collectScript from "./collect-page.txt";
 
 export { collectScript };
@@ -87,6 +91,7 @@ export interface CollectedChat {
   };
 }
 
+/** Validate / normalize an unknown webview result into a CollectedChat. */
 export function asCollectedChat(value: unknown): CollectedChat | null {
   const parsed = typeof value === "string" ? parseJson(value) : value;
   if (!parsed || typeof parsed !== "object") return null;

@@ -1,3 +1,7 @@
+/**
+ * Convert collected chat HTML into an Obsidian Markdown note:
+ * Turndown rules, footnotes, place links, media embeds, and frontmatter.
+ */
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
 import type { CollectedMessage, CollectedSource } from "./collect";
@@ -84,6 +88,7 @@ function nextMeaningfulSibling(node: Node): Node | null {
   return null;
 }
 
+/** Emit Obsidian $...$ / $$...$$ math from extracted LaTeX. */
 export function formatObsidianMath(latex: string, display = false): string {
   const body = stripMathDelimiters(latex);
   if (!body) return "";
@@ -91,6 +96,7 @@ export function formatObsidianMath(latex: string, display = false): string {
   return `$${body}$`;
 }
 
+/** Expand data-ct-math spans into visible math markup for PDF HTML. */
 export function expandMathInHtml(html: string): string {
   return html.replace(/<span\b([^>]*)>([\s\S]*?)<\/span>/gi, (all, attrs: string, inner: string) => {
     const mode = /\bdata-ct-math\s*=\s*"(display|inline)"/i.exec(attrs);
@@ -122,10 +128,12 @@ function escapeHtmlText(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Run Turndown (+ GFM / ChatTaker rules) on sanitized message HTML. */
 export function htmlToMarkdown(html: string): string {
   return turndown.turndown(stripResponseLabelsHtml(html)).replace(/\u00a0/g, " ").trim();
 }
 
+/** Drop chrome-only messages and strip repeated UI labels from HTML. */
 export function prepareMessages(messages: CollectedMessage[]): CollectedMessage[] {
   const kept: CollectedMessage[] = [];
   for (const message of messages) {
@@ -153,6 +161,10 @@ export function prepareMessages(messages: CollectedMessage[]): CollectedMessage[
   return kept;
 }
 
+/**
+ * Build the final vault note: frontmatter, Q&A body, media embeds, references.
+ * Returns null when there is nothing meaningful to save.
+ */
 export function buildNote(input: {
   conversationId: string;
   source: string;
@@ -223,6 +235,7 @@ function pruneUnusedFootnotes(
   return { body: rewritten, sources: next };
 }
 
+/** ISO-ish local datetime for the note frontmatter `datetime` field. */
 export function formatSavedAt(date: Date): string {
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
@@ -232,6 +245,7 @@ export function embedPath(path: string): string {
   return `![[${path.replace(/\\/g, "/")}]]`;
 }
 
+/** Replace %%CGM_MEDIA:id%% placeholders with wiki embeds / map links. */
 export function formatMediaMarkdown(
   id: string,
   mediaPaths: Map<string, string>,

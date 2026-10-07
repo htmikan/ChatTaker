@@ -1,3 +1,7 @@
+/**
+ * Optional citation-debug sidecar (*.debug.json) written next to a saved note
+ * when Settings → Citation debug is enabled.
+ */
 import type { Vault } from "obsidian";
 import type { CollectedChat, CitationDebugDump, CitationDebugRecord } from "./collect";
 import type { ChatSite } from "./filename";
@@ -5,6 +9,7 @@ import type { SaveFormat } from "./settings";
 
 export type { CitationDebugDump };
 
+/** Aggregate page-script citation records with footnote stats from the note. */
 export function buildCitationDebugDump(input: {
   site: ChatSite;
   format: SaveFormat;
@@ -56,6 +61,7 @@ export function buildCitationDebugDump(input: {
   };
 }
 
+/** Create or overwrite folder/basename.debug.json in the vault. */
 export async function writeCitationDebugDump(
   vault: Vault,
   folder: string,
