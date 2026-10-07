@@ -6,6 +6,7 @@ import { asUiLanguage, languageOptions, loadI18nYaml, setLanguage, t } from "./i
 import { buildMapHtml, canBuildMapHtml } from "./map";
 import { buildNote, formatSavedAt, formatSourcesMarkdown, formatObsidianMath, htmlToMarkdown } from "./markdown";
 import { buildPrintHtml } from "./pdf";
+import { enhancePlaceLinks, mapsSearchUrl } from "./places";
 
 const date = new Date(2026, 9, 2, 15, 8, 44);
 assert.equal(formatDatePattern(date, "YYMMDD_HHmmss"), "261002_150844");
@@ -417,6 +418,173 @@ setLanguage("en");
 loadI18nYaml("");
 assert.equal(t("view.save"), "Save chat");
 assert.equal(asUiLanguage("fr"), "en");
+
+// CODE 内の cl.exe 等を脚注化しない（ドメイン誤認の防止）
+const noFakeExeFootnote = buildNote({
+  site: "chatgpt",
+  conversationId: "exe1",
+  source: "https://chatgpt.com/c/exe1",
+  messages: [
+    {
+      role: "assistant",
+      html: '<p>可能です。<code>cl.exe</code> でビルドできます。</p><p>また <code>cmd.exe</code> でも使えます。</p>',
+    },
+  ],
+});
+assert.ok(noFakeExeFootnote);
+assert.match(noFakeExeFootnote, /`cl\.exe`/);
+assert.match(noFakeExeFootnote, /`cmd\.exe`/);
+assert.equal(noFakeExeFootnote.includes("## References"), false);
+assert.equal(noFakeExeFootnote.includes("https://cl.exe"), false);
+assert.equal(noFakeExeFootnote.includes("[^1]"), false);
+
+const noFakeCiteNameExe = buildNote({
+  site: "gemini",
+  conversationId: "exe2",
+  source: "https://gemini.google.com/app/exe2",
+  messages: [
+    {
+      role: "assistant",
+      html: '<p>これは<span data-ct-cite-name="cl.exe"></span>です。</p>',
+    },
+  ],
+});
+assert.ok(noFakeCiteNameExe);
+assert.match(noFakeCiteNameExe, /これは\s*cl\.exe\s*です。/);
+assert.equal(noFakeCiteNameExe.includes("https://cl.exe"), false);
+assert.equal(noFakeCiteNameExe.includes("[^1]"), false);
+
+assert.match(collectScript, /FAKE_DOMAIN_EXTS/);
+assert.match(collectScript, /isCodeLikeNode/);
+assert.match(collectScript, /isUrlCardReference/);
+assert.match(collectScript, /data-ct-keep-link/);
+assert.match(collectScript, /mapsSearchUrl/);
+assert.match(collectScript, /isPlaceCardRoot/);
+assert.equal(
+  mapsSearchUrl("横浜元町 香炉庵 新横浜店"),
+  "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent("横浜元町 香炉庵 新横浜店"),
+);
+
+const geminiPlaces = enhancePlaceLinks(
+  [
+    "横浜元町 香炉庵 新横浜店3.7 stars rating3.7 📍 デザート ショップ Open · Closes 9:00 PM",
+    "",
+    "横浜元町の人気和菓子店横浜元町 香炉庵 新横浜店クリックするとサイドパネルが開き、詳細が表示されます（キュービックプラザ新横浜 2F）では、上品です。",
+    "",
+    "崎陽軒 キュービックプラザ新横浜店3.8 stars rating3.8 · ¥1,000-¥2,000 📍 食料品店 Open · Closes 9:30 PM",
+  ].join("\n"),
+);
+assert.match(
+  geminiPlaces,
+  /\*\*\[横浜元町 香炉庵 新横浜店\]\(https:\/\/www\.google\.com\/maps\/search\/\?api=1&query=/,
+);
+assert.match(geminiPlaces, /3\.7 · 📍 デザート/);
+assert.equal(geminiPlaces.includes("クリックするとサイドパネル"), false);
+assert.match(
+  geminiPlaces,
+  /\*\*\[崎陽軒 キュービックプラザ新横浜店\]\(https:\/\/www\.google\.com\/maps\/search\/\?api=1&query=/,
+);
+
+const geminiPlaceNote = buildNote({
+  site: "gemini",
+  conversationId: "place1",
+  source: "https://gemini.google.com/app/place1",
+  messages: [
+    {
+      role: "assistant",
+      html:
+        "<p>おすすめです。</p>" +
+        "<p>横浜元町 香炉庵 新横浜店3.7 stars rating3.7 📍 デザート ショップ Open · Closes 9:00 PM</p>" +
+        "<p>横浜元町の人気和菓子店横浜元町 香炉庵 新横浜店クリックするとサイドパネルが開き、詳細が表示されます（2F）では上品です。</p>",
+    },
+  ],
+});
+assert.ok(geminiPlaceNote);
+assert.match(geminiPlaceNote, /maps\/search\/\?api=1&query=/);
+assert.match(geminiPlaceNote, /横浜元町%20香炉庵%20新横浜店|横浜元町 香炉庵 新横浜店/);
+assert.equal(geminiPlaceNote.includes("クリックするとサイドパネル"), false);
+assert.equal(geminiPlaceNote.includes("[^1]"), false);
+
+const chatgptPlaces = enhancePlaceLinks(
+  [
+    "**西松屋 コーナンセンター南店**★ 3.5•子供服店",
+    "",
+    "**Gapストア 港北東急S.C.店**★ 3.6•衣料品店",
+    "",
+    "**トイザらス・ベビーザらス 港北ニュータウン店**★ 3.5•子供服店地図データは現在利用不可です",
+    "",
+    "★3.5**西松屋 コーナンセンター南店**★ 3.5 · 子供服店★3.6**Gapストア 港北東急S.C.店**★ 3.6 · 衣料品店",
+  ].join("\n"),
+);
+assert.match(
+  chatgptPlaces,
+  /\*\*\[西松屋 コーナンセンター南店\]\(https:\/\/www\.google\.com\/maps\/search\/\?api=1&query=/,
+);
+assert.match(
+  chatgptPlaces,
+  /\*\*\[Gapストア 港北東急S\.C\.店\]\(https:\/\/www\.google\.com\/maps\/search\/\?api=1&query=/,
+);
+assert.match(chatgptPlaces, /3\.5 · 子供服店/);
+assert.equal(chatgptPlaces.includes("地図データは現在利用不可です"), false);
+assert.equal(chatgptPlaces.includes("★3.5**"), false);
+assert.equal(/子供服店\*\*\[Gap/.test(chatgptPlaces), false);
+
+const chatgptPlaceNote = buildNote({
+  site: "chatgpt",
+  conversationId: "place-cg",
+  source: "https://chatgpt.com/c/place-cg",
+  messages: [
+    {
+      role: "assistant",
+      html:
+        "<p><strong>西松屋 コーナンセンター南店</strong>★ 3.5•子供服店</p>" +
+        "<p><strong>Gapストア 港北東急S.C.店</strong>★ 3.6•衣料品店</p>",
+    },
+  ],
+});
+assert.ok(chatgptPlaceNote);
+assert.match(chatgptPlaceNote, /maps\/search\/\?api=1&query=/);
+assert.match(chatgptPlaceNote, /\*\*\[西松屋 コーナンセンター南店\]\(/);
+assert.equal(chatgptPlaceNote.includes("[^1]"), false);
+
+// ホームページを1行で出すリンクは脚注化せず本文に残す
+const homepageLine = buildNote({
+  site: "chatgpt",
+  conversationId: "home1",
+  source: "https://chatgpt.com/c/home1",
+  messages: [
+    {
+      role: "assistant",
+      html:
+        "<h2>第一候補：Docker Mailserver</h2>" +
+        '<p><a data-ct-keep-link="1" href="https://docker-mailserver.github.io/docker-mailserver/latest/">docker-mailserver.github.io</a></p>' +
+        "<p>Docker Mailserver は有力です。<a href=\"https://docker-mailserver.github.io/docker-mailserver/latest/config/advanced/mail-fetchmail/\">Docker Mailserver</a></p>",
+    },
+  ],
+});
+assert.ok(homepageLine);
+assert.match(homepageLine, /\[docker-mailserver\.github\.io\]\(https:\/\/docker-mailserver\.github\.io\/docker-mailserver\/latest\/\)/);
+assert.match(homepageLine, /有力です。\[\^1\]/);
+assert.match(homepageLine, /## References/);
+assert.equal(/^\[\^1\]\s*$/m.test(homepageLine), false);
+
+const homepageStandaloneBlock = buildNote({
+  site: "chatgpt",
+  conversationId: "home2",
+  source: "https://chatgpt.com/c/home2",
+  messages: [
+    {
+      role: "assistant",
+      html:
+        "<h2>第二候補：Mailu</h2>" +
+        '<p><a href="https://mailu.io/">mailu.io</a></p>' +
+        "<p>Mailuも候補です。</p>",
+    },
+  ],
+});
+assert.ok(homepageStandaloneBlock);
+assert.match(homepageStandaloneBlock, /\[mailu\.io\]\(https:\/\/mailu\.io\/\)/);
+assert.equal(homepageStandaloneBlock.includes("[^1]"), false);
 
 const geminiCite = buildNote({
   site: "gemini",

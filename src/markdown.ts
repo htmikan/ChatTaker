@@ -11,6 +11,7 @@ import {
 } from "./footnotes";
 import { stripPromptFromMarkdown, stripResponseLabelsHtml } from "./labels";
 import type { MediaExtras } from "./media";
+import { enhancePlaceLinks } from "./places";
 import { t } from "./i18n";
 
 export { formatSourcesMarkdown, replaceSourceLinksInHtml, replaceSourceLinksInMarkdown };
@@ -167,11 +168,14 @@ export function buildNote(input: {
   const mediaPaths = input.mediaPaths ?? new Map<string, string>();
   const mediaExtras = input.mediaExtras ?? new Map<string, MediaExtras>();
   const sources = collectSources(input.sources ?? [], input.messages);
-  const body = prepareMessages(input.messages)
+  let body = prepareMessages(input.messages)
     .map((message) => {
       const mediaIds = (message.media ?? []).map((item) => item.id);
       let markdown = htmlToMarkdown(applyFootnoteMarkers(message.html, sources));
-      if (message.role !== "user") markdown = replaceSourceLinksInMarkdown(markdown, sources);
+      if (message.role !== "user") {
+        markdown = replaceSourceLinksInMarkdown(markdown, sources);
+        if (site === "gemini" || site === "chatgpt") markdown = enhancePlaceLinks(markdown);
+      }
       markdown = applyMediaPaths(markdown, mediaPaths, mediaExtras, mediaIds);
       if (!markdown) return "";
       if (message.role === "user") return asQuestionCallout(markdown);
@@ -180,7 +184,9 @@ export function buildNote(input: {
     .filter((section) => section.length > 0)
     .join("\n\n");
   if (!body) return null;
-  const references = formatSourcesMarkdown(sources);
+  const pruned = pruneUnusedFootnotes(body, sources);
+  body = pruned.body;
+  const references = formatSourcesMarkdown(pruned.sources);
   const frontmatter = [
     "---",
     `${idField(site)}: ${yamlQuote(input.conversationId)}`,
@@ -190,6 +196,32 @@ export function buildNote(input: {
   if (references) frontmatter.push("", references);
   frontmatter.push("");
   return frontmatter.join("\n");
+}
+
+/** 本文に [^N] が無い参照（ホームページ1行リンクなど）を落とし、番号を詰め直す */
+function pruneUnusedFootnotes(
+  body: string,
+  sources: CollectedSource[],
+): { body: string; sources: CollectedSource[] } {
+  const used = new Set<number>();
+  for (const match of body.matchAll(/\[\^(\d+)\]/g)) used.add(Number(match[1]));
+  if (!used.size) return { body, sources: [] };
+  if (used.size === sources.length && [...used].every((n) => n >= 1 && n <= sources.length)) {
+    return { body, sources };
+  }
+  const map = new Map<number, number>();
+  const next: CollectedSource[] = [];
+  for (let index = 0; index < sources.length; index++) {
+    const old = index + 1;
+    if (!used.has(old)) continue;
+    next.push(sources[index]);
+    map.set(old, next.length);
+  }
+  const rewritten = body.replace(/\[\^(\d+)\]/g, (_all, raw: string) => {
+    const mapped = map.get(Number(raw));
+    return mapped ? `[^${mapped}]` : "";
+  });
+  return { body: rewritten, sources: next };
 }
 
 export function formatSavedAt(date: Date): string {

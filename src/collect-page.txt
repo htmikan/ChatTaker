@@ -231,6 +231,23 @@
     return fromText && !isNoiseSourceUrl(fromText) ? fromText : '';
   }
 
+  /** ドメイン風に見えるが実体はファイル名（cl.exe など）の拡張子 */
+  var FAKE_DOMAIN_EXTS =
+    /^(exe|dll|bat|cmd|com|msi|sys|bin|so|dylib|app|jar|py|js|mjs|cjs|ts|tsx|jsx|c|cc|cpp|cxx|h|hpp|rs|go|java|kt|swift|rb|php|pl|sh|bash|zsh|ps1|md|txt|json|ya?ml|toml|xml|html?|css|scss|less|pdf|png|jpe?g|gif|svg|webp|ico|zip|tar|gz|tgz|7z|rar|log|bak|tmp|obj|o|lib|a|wasm|map|lock|ini|cfg|conf|csv|tsv|sql|db|doc|docx|xls|xlsx|ppt|pptx)$/i;
+
+  function isCodeLikeNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || '').toUpperCase();
+    if (tag === 'CODE' || tag === 'PRE' || tag === 'SAMP' || tag === 'KBD') return true;
+    var el = node.parentElement;
+    while (el) {
+      var p = String(el.tagName || '').toUpperCase();
+      if (p === 'CODE' || p === 'PRE' || p === 'SAMP' || p === 'KBD') return true;
+      el = el.parentElement;
+    }
+    return false;
+  }
+
   function isCitationPill(node) {
     if (!node || node.nodeType !== 1) return false;
     var tag = String(node.tagName || '').toUpperCase();
@@ -246,12 +263,15 @@
     if (/webpage-citation|citation-pill|source-pill|source-inline-chip(?!-container)|cite-pill|reference-pill|group\/footnote|\/footnote/.test(cls)) return true;
     var aria = String(node.getAttribute && node.getAttribute('aria-label') || '').toLowerCase();
     if (/citation from|引用元|出典の詳細|ソースの詳細|view source|からの引用|出典を表示|view citation|情報源/.test(aria)) return true;
+    // CODE/PRE 内の cl.exe 等を引用 pill と誤認しない
+    if (isCodeLikeNode(node)) return false;
     // ChatGPT の短縮表示（例: WWebull+1 / US EPA +1）— BUTTON 以外の span にも付く
     if (looksLikeCiteChipText(node)) return true;
     return false;
   }
 
   function looksLikeCiteChipText(node) {
+    if (isCodeLikeNode(node)) return false;
     var text = String(node.innerText || node.textContent || '')
       .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
       .replace(/\s+/g, ' ')
@@ -259,8 +279,10 @@
     if (!text || text.length > 48) return false;
     if (/^(https?:\/\/|www\.)/i.test(text)) return false;
     if (/[=\/\\]/.test(text)) return false;
-    // 例: example.com / example.com+1 / WWebull+1 / US EPA +1 / 楽天市場+2
-    if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,30}\.[A-Za-z]{2,}(?:\s*[+＋]\d+)?$/.test(text)) return true;
+    // 例: example.com / example.com+1 — ただし cl.exe / note.md は除外
+    var domainLike = /^([A-Za-z0-9][A-Za-z0-9._-]{0,30})\.([A-Za-z]{2,})(?:\s*[+＋]\d+)?$/.exec(text);
+    if (domainLike) return !FAKE_DOMAIN_EXTS.test(domainLike[2]);
+    // 例: WWebull+1 / US EPA +1 / 楽天市場+2
     if (/^[A-Za-z][A-Za-z0-9._-]{1,30}\s*[+＋]\d+$/.test(text)) return true;
     if (/^[A-Za-z][A-Za-z0-9 ._-]{1,30}\s*[+＋]\d+$/.test(text)) return true;
     if (/^[\u3040-\u30ff\u4e00-\u9fff\w][\u3040-\u30ff\u4e00-\u9fff\w ._-]{0,30}\s*[+＋]\d+$/.test(text)) return true;
@@ -363,13 +385,33 @@
         if (/help\.openai\.com$/i.test(u.hostname)) return true;
       }
       if (/help\.openai\.com$/i.test(host)) return true;
-      if (/gemini\.google\.com$/i.test(host) && /^\/(u\/\d+\/)?app\/?/.test(path)) return true;
+      if (/gemini\.google\.com$/i.test(host)) {
+        if (/^\/(u\/\d+\/)?app\/?/.test(path)) return true;
+        if (path === '/' || path === '' || /^\/images\/?$/i.test(path)) return true;
+      }
       if (/google\./i.test(host) && /^\/search\b/.test(path)) return true;
       if (/gstatic\.com$/i.test(host)) return true;
       if (/accounts\.google\.com$/i.test(host)) return true;
       if (/microsoftonline\.com$|live\.com$|apple\.com$/i.test(host) && /\/(oauth|authorize|login|signin)/i.test(path + u.search)) return true;
     } catch (e) {}
     return false;
+  }
+
+  /** ChatGPT のホームページカード（1行リンク）— 脚注化せず本文リンクとして残す */
+  function isUrlCardReference(node) {
+    var el = node;
+    while (el && el.getAttribute) {
+      var type = String(el.getAttribute('data-content-reference-type') || '');
+      if (type === 'url') return true;
+      if (type === 'grouped_webpages') return false;
+      if (el.hasAttribute('data-assistant-url-reference')) return true;
+      el = el.parentElement;
+    }
+    return false;
+  }
+
+  function keepLinkHtml(href, text) {
+    return '<p><a data-ct-keep-link="1" href="' + esc(href) + '">' + esc(text) + '</a></p>';
   }
 
   function linkFromCitation(node) {
@@ -390,17 +432,22 @@
     var noiseFiltered = [];
     var rawHref = resolveHrefFromNode(node);
     if (rawHref && isNoiseSourceUrl(rawHref)) noiseFiltered.push(rawHref);
+    var keepCard = isUrlCardReference(node);
     var extra = {
       resolvedHref: href || (payloadSources[0] && payloadSources[0].url) || '',
       jslogUrls: logUrls,
       noiseFiltered: noiseFiltered,
       payloadCount: payloadSources.length,
+      urlCard: keepCard,
     };
     if (payloadSources.length) {
       var fromPayload = payloadSources.map(function (item) {
-        return '<a href="' + esc(item.url) + '">' + esc(item.title || title || citeName || item.url) + '</a>';
+        var label = item.title || title || citeName || item.url;
+        return keepCard
+          ? keepLinkHtml(item.url, label)
+          : '<a href="' + esc(item.url) + '">' + esc(label) + '</a>';
       }).join('');
-      recordCitationDebug(node, fromPayload, payloadSources.length > 1 ? 'payload-multi' : 'payload', extra);
+      recordCitationDebug(node, fromPayload, keepCard ? 'url-card' : (payloadSources.length > 1 ? 'payload-multi' : 'payload'), extra);
       return fromPayload;
     }
     if (logUrls.length > 1) {
@@ -411,14 +458,18 @@
       return multi;
     }
     if (href) {
-      var anchor = '<a href="' + esc(href) + '">' + esc(title || citeName || href) + '</a>';
-      recordCitationDebug(node, anchor, 'anchor', extra);
+      var anchor = keepCard
+        ? keepLinkHtml(href, title || citeName || href)
+        : '<a href="' + esc(href) + '">' + esc(title || citeName || href) + '</a>';
+      recordCitationDebug(node, anchor, keepCard ? 'url-card' : 'anchor', extra);
       return anchor;
     }
     var textUrl = firstHttpUrl(title + ' ' + aria + ' ' + (node.innerText || ''));
     if (textUrl) {
-      var textAnchor = '<a href="' + esc(textUrl) + '">' + esc(title || textUrl) + '</a>';
-      recordCitationDebug(node, textAnchor, 'anchor', extra);
+      var textAnchor = keepCard
+        ? keepLinkHtml(textUrl, title || textUrl)
+        : '<a href="' + esc(textUrl) + '">' + esc(title || textUrl) + '</a>';
+      recordCitationDebug(node, textAnchor, keepCard ? 'url-card' : 'anchor', extra);
       return textAnchor;
     }
     // URL が無いチップは内側の通常リンクを捨てない
@@ -1082,6 +1133,107 @@
     return false;
   }
 
+  function mapsSearchUrl(query) {
+    var q = String(query || '').trim();
+    if (!q) return '';
+    return 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(q);
+  }
+
+  function placeCardText(node) {
+    return String(node.innerText || node.textContent || '')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function looksLikePlaceCardText(text) {
+    if (!text || text.length > 400) return false;
+    if (/\d(?:\.\d)?\s*stars?\s*rating/i.test(text) && (/📍|Open\s*·|Closes\s+/i.test(text) || /営業/.test(text))) return true;
+    if (/クリックするとサイドパネルが開き/.test(text) && text.length < 120) return true;
+    // ChatGPT 地図下の店舗リンク: 「西松屋 …★ 3.5•子供服店」
+    if (/★\s*\d(?:\.\d)?/.test(text) && /[·•]/.test(text) && text.length < 200) return true;
+    return false;
+  }
+
+  function isPlaceCardRoot(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (!looksLikePlaceCardText(placeCardText(node))) return false;
+    if (!node.querySelectorAll) return true;
+    var kids = node.querySelectorAll('*');
+    for (var i = 0; i < kids.length; i++) {
+      if (looksLikePlaceCardText(placeCardText(kids[i]))) return false;
+    }
+    return true;
+  }
+
+  function extractPlaceName(node, text) {
+    var nameEl = null;
+    if (node.querySelector) {
+      try {
+        nameEl = node.querySelector('strong, b, h1, h2, h3, h4, [class*="title"], [class*="name"], [class*="place"]');
+      } catch (e) {
+        nameEl = node.querySelector('strong, b, h1, h2, h3, h4');
+      }
+    }
+    if (nameEl) {
+      var fromEl = String(nameEl.innerText || nameEl.textContent || '').replace(/\s+/g, ' ').trim();
+      if (
+        fromEl &&
+        fromEl.length >= 2 &&
+        fromEl.length <= 80 &&
+        !/\bstars?\s*rating\b/i.test(fromEl) &&
+        !/★/.test(fromEl)
+      ) {
+        return fromEl;
+      }
+    }
+    var rated = /^(.+?)(\d(?:\.\d)?)\s*stars?\s*rating/i.exec(text);
+    if (rated) {
+      var name = String(rated[1] || '').trim();
+      if (name && name.length <= 80) return name;
+    }
+    var starred = /^(.+?)\s*★\s*\d(?:\.\d)?/.exec(text);
+    if (starred) {
+      var starName = String(starred[1] || '')
+        .replace(/^\d(?:\.\d)?\s*/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (starName && starName.length >= 2 && starName.length <= 80) return starName;
+    }
+    var panel = /^(.+?)クリックするとサイドパネル/.exec(text);
+    if (panel) {
+      var panelName = String(panel[1] || '').trim();
+      if (panelName && panelName.length <= 80) return panelName;
+    }
+    return '';
+  }
+
+  function placeCardHtml(node) {
+    var text = placeCardText(node);
+    var name = extractPlaceName(node, text);
+    if (!name) return '';
+    var url = mapsSearchUrl(name);
+    if (!url) return '';
+    var rest = text;
+    var idx = rest.indexOf(name);
+    if (idx >= 0) rest = rest.slice(idx + name.length);
+    rest = rest
+      .replace(/クリックするとサイドパネルが開き、詳細が表示されます/g, '')
+      .replace(/Opens? (?:in )?a side panel[^.。]*/gi, '')
+      .replace(/地図データは現在利用不可です/g, '')
+      .replace(/Map data (?:is )?currently unavailable\.?/gi, '')
+      .replace(/(\d(?:\.\d)?)\s*stars?\s*rating\1?/gi, '$1')
+      .replace(/★\s*/g, '')
+      .replace(/\s*[•]\s*/g, ' · ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    var html =
+      '<p><strong><a data-ct-keep-link="1" href="' + esc(url) + '">' + esc(name) + '</a></strong>';
+    if (rest) html += '<br>' + esc(rest);
+    html += '</p>';
+    return html;
+  }
+
   function sanitize(node, inList) {
     if (!node) return '';
     if (node.nodeType === 3) return esc(node.nodeValue || '');
@@ -1104,6 +1256,10 @@
     if (isMathRoot(node)) return mathFromNode(node);
     if (isPromptLabelNode(node)) return '';
     if (isSourcesChrome(node)) return extractLinksHtml(node);
+    if (isPlaceCardRoot(node)) {
+      var card = placeCardHtml(node);
+      if (card) return card;
+    }
     if (isCitationPill(node)) return linkFromCitation(node);
     if (tag === 'IMG') return registerImageNode(node);
     if (isMapNode(node)) return registerMapNode(node);

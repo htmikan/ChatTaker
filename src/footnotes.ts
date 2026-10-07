@@ -12,14 +12,14 @@ export function collectSources(base: CollectedSource[], messages: CollectedMessa
     if (!url) continue;
     upsertSource(sources, url, item.title || url);
   }
-  for (const message of messages) absorbUrlsFromHtml(message.html || "", sources);
+  for (const message of messages) absorbUrlsFromHtml(markStandaloneAnchors(message.html || ""), sources);
   return sources;
 }
 
 export function applyFootnoteMarkers(html: string, sources: CollectedSource[]): string {
   if (!html) return html;
-  absorbUrlsFromHtml(html, sources);
-  let result = stripSourceChrome(html);
+  let result = markStandaloneAnchors(stripSourceChrome(html));
+  absorbUrlsFromHtml(result, sources);
   result = replaceBareCiteChips(result);
   for (const tag of collectAnchorTags(chromeHtml(html))) {
     const href = usableUrl(hrefFromAttrs(tag) || httpUrl(plainTextFromHtml(tag)));
@@ -32,6 +32,9 @@ export function applyFootnoteMarkers(html: string, sources: CollectedSource[]): 
 
   const sequential = { next: 0 };
   result = result.replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (all, attrs: string, inner: string) => {
+    if (/\bdata-ct-keep-link\s*=/.test(attrs)) {
+      return all.replace(/\s*data-ct-keep-link\s*=\s*(["'])[^"']*\1/i, "");
+    }
     const href = hrefFromAttrs(attrs);
     const title = plainTextFromHtml(inner);
     const url = usableUrl(httpUrl(title) || href);
@@ -63,10 +66,54 @@ export function applyFootnoteMarkers(html: string, sources: CollectedSource[]): 
 }
 
 export function replaceSourceLinksInMarkdown(markdown: string, sources: CollectedSource[]): string {
-  const replaced = markdown.replace(/\[([^\]]*)\]\((https?:[^)\s]+)(?:\s+"[^"]*")?\)/g, (_all, text: string, url: string) => {
-    return `[^${upsertSource(sources, url, text || url)}]`;
+  const replaced = markdown.replace(/\[([^\]]*)\]\((https?:[^)\s]+)(?:\s+"[^"]*")?\)/g, (all, text: string, url: string, offset: number, full: string) => {
+    if (isStandaloneMarkdownLinkLine(full, offset, all.length)) return all;
+    if (isMapsSearchMarkdownUrl(url)) return all;
+    return `[^${upsertSource(sources, usableUrl(url) || url, text || url)}]`;
   });
   return replaceBareUrls(replaced, sources);
+}
+
+function isMapsSearchMarkdownUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      /google\./i.test(parsed.hostname) &&
+      /^\/maps\/search\/?$/i.test(parsed.pathname) &&
+      parsed.searchParams.get("api") === "1"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** 行全体が1つの Markdown リンクだけなら、ホームページ提示などとみなして脚注化しない */
+function isStandaloneMarkdownLinkLine(markdown: string, offset: number, length: number): boolean {
+  const lineStart = markdown.lastIndexOf("\n", offset - 1) + 1;
+  const lineEndIdx = markdown.indexOf("\n", offset + length);
+  const line = markdown.slice(lineStart, lineEndIdx < 0 ? markdown.length : lineEndIdx).trim();
+  return line === markdown.slice(offset, offset + length).trim();
+}
+
+/**
+ * 段落・見出し直後など、ブロック内の唯一のリンクを本文リンクとして残す。
+ * ChatGPT がホームページを1行で出すケースの保険。
+ */
+function markStandaloneAnchors(html: string): string {
+  let result = html.replace(/<(p|div|li|td|th)(\s[^>]*)?>([\s\S]*?)<\/\1>/gi, (all, tag: string, attrs: string | undefined, inner: string) => {
+    const compact = inner
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .replace(/^(?:\s|&nbsp;|<br\s*\/?\s*>)+|(?:\s|&nbsp;|<br\s*\/?\s*>)+$/gi, "")
+      .trim();
+    if (!/^<a\b[^>]*>[\s\S]*?<\/a>$/i.test(compact)) return all;
+    if (/\bdata-ct-keep-link\s*=/i.test(compact)) return all;
+    return `<${tag}${attrs || ""}>${compact.replace(/<a\b/i, '<a data-ct-keep-link="1"')}</${tag}>`;
+  });
+  result = result.replace(
+    /(<\/(?:h[1-6]|p|div|section|article)>|^)\s*(<a\b(?![^>]*\bdata-ct-keep-link\b)[^>]*>[\s\S]*?<\/a>)\s*(?=<h[1-6]\b|<p\b|<div\b|<section\b|<article\b|<ul\b|<ol\b|<hr\b|$)/gi,
+    (_all, before: string, anchor: string) => `${before}${anchor.replace(/<a\b/i, '<a data-ct-keep-link="1"')}`,
+  );
+  return result;
 }
 
 export function replaceSourceLinksInHtml(html: string, sources: CollectedSource[]): string {
@@ -87,6 +134,7 @@ export function formatSourcesMarkdown(sources: CollectedSource[]): string {
 
 function absorbUrlsFromHtml(html: string, sources: CollectedSource[]): void {
   html.replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (_all, attrs: string, inner: string) => {
+    if (/\bdata-ct-keep-link\s*=/.test(attrs)) return _all;
     const href = hrefFromAttrs(attrs);
     const title = plainTextFromHtml(inner);
     const url = usableUrl(httpUrl(title) || href);
@@ -117,12 +165,18 @@ function replaceBareUrls(markdown: string, sources: CollectedSource[]): string {
   return chunks
     .map((chunk) => {
       if (chunk.startsWith("```")) return chunk;
-      return chunk.replace(/https?:\/\/[^\s<>\[\]`]+/g, (raw, offset: number) => {
-        const before = chunk.slice(Math.max(0, offset - 2), offset);
-        if (before.endsWith("](") || before.endsWith("]:")) return raw;
-        const url = usableUrl(trimUrl(raw));
-        return url ? `[^${upsertSource(sources, url, url)}]${raw.slice(url.length)}` : raw;
-      });
+      return chunk
+        .split("\n")
+        .map((line) => {
+          if (/^\s*https?:\/\/\S+\s*$/i.test(line)) return line;
+          return line.replace(/https?:\/\/[^\s<>\[\]`]+/g, (raw, offset: number) => {
+            const before = line.slice(Math.max(0, offset - 2), offset);
+            if (before.endsWith("](") || before.endsWith("]:")) return raw;
+            const url = usableUrl(trimUrl(raw));
+            return url ? `[^${upsertSource(sources, url, url)}]${raw.slice(url.length)}` : raw;
+          });
+        })
+        .join("\n");
     })
     .join("");
 }
@@ -164,9 +218,15 @@ function httpUrl(value: string): string {
   return match ? trimUrl(decodeHtmlAttr(match[0])) : "";
 }
 
+/** ドメイン風に見えるが実体はファイル名の拡張子（cl.exe など） */
+const FAKE_DOMAIN_EXTS =
+  /^(exe|dll|bat|cmd|com|msi|sys|bin|so|dylib|app|jar|py|js|mjs|cjs|ts|tsx|jsx|c|cc|cpp|cxx|h|hpp|rs|go|java|kt|swift|rb|php|pl|sh|bash|zsh|ps1|md|txt|json|ya?ml|toml|xml|html?|css|scss|less|pdf|png|jpe?g|gif|svg|webp|ico|zip|tar|gz|tgz|7z|rar|log|bak|tmp|obj|o|lib|a|wasm|map|lock|ini|cfg|conf|csv|tsv|sql|db|doc|docx|xls|xlsx|ppt|pptx)$/i;
+
 function hostAsUrl(value: string): string {
   const host = (value || "").trim().replace(/^www\./i, "");
-  if (!/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:\/\S*)?$/i.test(host)) return "";
+  const match = /^([a-z0-9][a-z0-9.-]*)\.([a-z]{2,})(?:\/\S*)?$/i.exec(host);
+  if (!match) return "";
+  if (FAKE_DOMAIN_EXTS.test(match[2])) return "";
   return `https://${host}`;
 }
 
@@ -211,7 +271,10 @@ function usableUrl(url: string): string {
     ) {
       return "";
     }
-    if (/gemini\.google\.com$/i.test(host) && /^\/(u\/\d+\/)?app\/?/.test(path)) return "";
+    if (/gemini\.google\.com$/i.test(host)) {
+      if (/^\/(u\/\d+\/)?app\/?/.test(path)) return "";
+      if (path === "/" || path === "" || /^\/images\/?$/i.test(path)) return "";
+    }
     if (/google\./i.test(host) && /^\/search\b/.test(path)) return "";
     if (/gstatic\.com$/i.test(host)) return "";
     if (/accounts\.google\.com$/i.test(host)) return "";
