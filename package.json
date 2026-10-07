@@ -1,6 +1,6 @@
 {
   "name": "chattaker",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Saves your ChatGPT and Gemini conversation history to your vault.",
   "main": "main.js",
   "scripts": {
