@@ -1,6 +1,6 @@
 # ChatTaker
 
-Saves your ChatGPT and Gemini conversation history to your vault.
+Open the official ChatGPT / Gemini web UI in Obsidian and save conversations to your vault.
 
 Desktop Obsidian only (`isDesktopOnly`).
 
@@ -8,7 +8,7 @@ Desktop Obsidian only (`isDesktopOnly`).
 
 ## 日本語
 
-ChatGPT、Gemini に質問した内容と回答を記録するための、質素なプラグインです。  
+ChatGPT / Gemini の公式 Web UI で行った会話を、Vault に Markdown ノートとして保存するプラグインです。API キーは不要です。  
 Cursor を使用してバイブコーディングで作成しました。
 
 1. 有効にすると Left Ribbon にボタンが現れ、ボタンを押すと Right Sidebar に ChatGPT / Gemini が表示されます。
@@ -32,7 +32,7 @@ Cursor を使用してバイブコーディングで作成しました。
 
 ## English
 
-This is a simple plugin for recording the questions you ask ChatGPT and Gemini, along with their responses.  
+A simple plugin that records ChatGPT and Gemini conversations from their official web UIs into your vault. No API key required—this is not an API chat client.  
 I created it using Cursor and Vibe Coding.
 
 1. When enabled, a button appears on the Left Ribbon; clicking it displays ChatGPT and Gemini in the Right Sidebar.
