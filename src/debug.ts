@@ -12,11 +12,8 @@ export function buildCitationDebugDump(input: {
   data: CollectedChat;
   noteMarkdown?: string | null;
 }): CitationDebugDump {
-  const pageDebug = (input.data.debug && typeof input.data.debug === "object" ? input.data.debug : {}) as {
-    citations?: CitationDebugRecord[];
-    summary?: Record<string, number>;
-  };
-  const citations = Array.isArray(pageDebug.citations) ? pageDebug.citations : [];
+  const pageDebug = input.data.debug;
+  const citations: CitationDebugRecord[] = Array.isArray(pageDebug?.citations) ? pageDebug.citations : [];
   const sources = input.data.sources ?? [];
   const messages = input.data.items
     .filter((item) => item.role !== "user")
@@ -46,7 +43,7 @@ export function buildCitationDebugDump(input: {
       citeNamesInHtml: messages.reduce((sum, m) => sum + m.citeNameCount, 0),
       footnoteMarkers,
       footnoteDefs,
-      ...(pageDebug.summary || {}),
+      ...(pageDebug?.summary || {}),
     },
     sources,
     citations,

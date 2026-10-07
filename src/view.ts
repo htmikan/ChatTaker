@@ -1,4 +1,4 @@
-import { ItemView, Notice, TFolder, Vault, WorkspaceLeaf } from "obsidian";
+import { ItemView, Notice, Platform, TFolder, Vault, WorkspaceLeaf } from "obsidian";
 import type ChatTakerPlugin from "./main";
 import { PLUGIN_ICON_ID } from "./icon";
 import { asCollectedChat, collectScript, type CollectedChat } from "./collect";
@@ -181,11 +181,12 @@ export class ChatTakerView extends ItemView {
       this.webview.remove();
       this.webview = null;
     }
+    // Electron <webview> is not in HTMLElementTagNameMap; createEl typing rejects the tag name.
     const webview = this.contentEl.ownerDocument.createElement("webview") as ChatWebview;
+    webview.classList.add("chattaker-webview");
     webview.setAttribute("partition", sitePartition(this.site));
     webview.setAttribute("allowpopups", "true");
     webview.setAttribute("useragent", chromeUserAgent());
-    webview.classList.add("chattaker-webview");
     this.contentEl.appendChild(webview);
     webview.addEventListener("dom-ready", () => {
       void this.inject();
@@ -426,11 +427,10 @@ function mediaExtra(saved: number, failed: number): string {
 }
 
 function chromeUserAgent(): string {
-  const raw = navigator.userAgent || "";
-  if (raw.includes("Macintosh")) {
+  if (Platform.isMacOS) {
     return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
   }
-  if (raw.includes("Linux") && !raw.includes("Android")) {
+  if (Platform.isLinux) {
     return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
   }
   return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";

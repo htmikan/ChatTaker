@@ -64,7 +64,7 @@ export function t(key: string, vars?: Record<string, string | number>): string {
 function parseI18nYaml(source: string): Catalog {
   const languages: Record<string, string> = {};
   const strings: Catalog["strings"] = {};
-  let section: "languages" | string | null = null;
+  let section: string | null = null;
   for (const rawLine of source.split(/\r?\n/)) {
     const line = rawLine.replace(/\t/g, "  ");
     if (!line.trim() || line.trim().startsWith("#")) continue;

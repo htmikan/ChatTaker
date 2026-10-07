@@ -27,7 +27,7 @@ const turndown = new TurndownService({
 turndown.addRule("fencedCode", {
   filter: "pre",
   replacement: (_content, node) => {
-    const element = node as HTMLElement;
+    const element = node;
     const code = element.querySelector("code");
     const className = `${code?.getAttribute("class") || ""} ${element.getAttribute("class") || ""}`;
     const match = /language-([A-Za-z0-9_+-]+)/.exec(className);
@@ -38,27 +38,26 @@ turndown.addRule("fencedCode", {
 });
 
 turndown.addRule("ctMedia", {
-  filter: (node) => node.nodeName === "IMG" && Boolean((node as HTMLElement).getAttribute("data-ct-media")),
+  filter: (node) => node.nodeName === "IMG" && Boolean(node.getAttribute("data-ct-media")),
   replacement: (_content, node) => {
-    const id = (node as HTMLElement).getAttribute("data-ct-media") || "";
+    const id = node.getAttribute("data-ct-media") || "";
     return id ? `\n\n%%CGM_MEDIA:${id}%%\n\n` : "";
   },
 });
 
 turndown.addRule("ctMath", {
-  filter: (node) => node.nodeName === "SPAN" && Boolean((node as HTMLElement).getAttribute("data-ct-math")),
+  filter: (node) => node.nodeName === "SPAN" && Boolean(node.getAttribute("data-ct-math")),
   replacement: (_content, node) => {
-    const element = node as HTMLElement;
-    const latex = (element.textContent || "").trim();
+    const latex = (node.textContent || "").trim();
     if (!latex) return "";
-    return formatObsidianMath(latex, element.getAttribute("data-ct-math") === "display");
+    return formatObsidianMath(latex, node.getAttribute("data-ct-math") === "display");
   },
 });
 
 turndown.addRule("ctFootnote", {
-  filter: (node) => node.nodeName === "SPAN" && Boolean((node as HTMLElement).getAttribute("data-ct-fn")),
+  filter: (node) => node.nodeName === "SPAN" && Boolean(node.getAttribute("data-ct-fn")),
   replacement: (_content, node) => {
-    const n = (node as HTMLElement).getAttribute("data-ct-fn") || "";
+    const n = node.getAttribute("data-ct-fn") || "";
     return n ? `[^${n}]` : "";
   },
 });

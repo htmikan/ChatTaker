@@ -169,7 +169,7 @@ function replaceBareUrls(markdown: string, sources: CollectedSource[]): string {
         .split("\n")
         .map((line) => {
           if (/^\s*https?:\/\/\S+\s*$/i.test(line)) return line;
-          return line.replace(/https?:\/\/[^\s<>\[\]`]+/g, (raw, offset: number) => {
+          return line.replace(/https?:\/\/[^\s<>[\]`]+/g, (raw, offset: number) => {
             const before = line.slice(Math.max(0, offset - 2), offset);
             if (before.endsWith("](") || before.endsWith("]:")) return raw;
             const url = usableUrl(trimUrl(raw));
@@ -198,7 +198,7 @@ function replaceBareCiteChips(html: string): string {
     parts[i] = parts[i].replace(
       /([A-Za-z\u3040-\u30ff\u4e00-\u9fff][A-Za-z0-9._\u3040-\u30ff\u4e00-\u9fff -]{0,40}?)\s*[+＋](\d+)(?=[^\w+]|$)/g,
       (_all, name: string) => {
-        let cleaned = name.replace(/[\u200b\u200c\u200d\ufeff]/g, "").replace(/\s+/g, " ").trim();
+        let cleaned = name.replace(/\u200b|\u200c|\u200d|\ufeff/g, "").replace(/\s+/g, " ").trim();
         if (/^([A-Za-z])\1[A-Za-z]/.test(cleaned)) cleaned = cleaned.slice(1);
         if (!cleaned || cleaned.length < 2) return _all;
         return `<span data-ct-cite-name="${escapeHtmlAttr(cleaned)}"></span>`;
@@ -299,7 +299,7 @@ function upsertSource(sources: CollectedSource[], url: string, title: string): n
 function findSourceIndexByName(sources: CollectedSource[], rawName: string): number | null {
   let needle = rawName
     .replace(/\u00a0/g, " ")
-    .replace(/[\u200b\u200c\u200d\ufeff]/g, "")
+    .replace(/\u200b|\u200c|\u200d|\ufeff/g, "")
     .replace(/\s*[+＋]\d+\s*$/g, "")
     .replace(/\s+/g, " ")
     .trim()
@@ -310,7 +310,7 @@ function findSourceIndexByName(sources: CollectedSource[], rawName: string): num
   if (!needle) return null;
   for (let index = 0; index < sources.length; index++) {
     let title = (sources[index].title || "")
-      .replace(/[\u200b\u200c\u200d\ufeff]/g, "")
+      .replace(/\u200b|\u200c|\u200d|\ufeff/g, "")
       .replace(/\s*[+＋]\d+\s*$/g, "")
       .replace(/\s+/g, " ")
       .trim()
@@ -375,5 +375,5 @@ function escapeHtmlAttr(value: string): string {
 }
 
 function escapeMarkdownLinkText(value: string): string {
-  return value.replace(/[\[\]]/g, "\\$&").replace(/\r?\n/g, " ").trim() || "link";
+  return value.replace(/[[\]]/g, "\\$&").replace(/\r?\n/g, " ").trim() || "link";
 }

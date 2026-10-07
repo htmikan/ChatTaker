@@ -9,7 +9,7 @@ declare module "*.yaml" {
 }
 
 declare module "turndown-plugin-gfm" {
-  import TurndownService = require("turndown");
+  import type TurndownService from "turndown";
 
   export function gfm(service: TurndownService): void;
 }

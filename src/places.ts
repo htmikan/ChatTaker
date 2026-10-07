@@ -43,7 +43,7 @@ export function enhancePlaceLinks(markdown: string): string {
 
   // Gemini: Name3.7 stars rating3.7 📍 …
   result = result.replace(
-    /(^|\n)([^\n\[\]*]{2,80}?)(\d(?:\.\d)?)\s*stars?\s*rating\3?\b([^\n]*)/gi,
+    /(^|\n)([^\n[\]*]{2,80}?)(\d(?:\.\d)?)\s*stars?\s*rating\3?\b([^\n]*)/gi,
     (all, lead: string, rawName: string, rating: string, rest: string) => {
       const name = String(rawName || "").trim();
       if (!name || name.length < 2 || /https?:\/\//i.test(name)) return all;
@@ -57,7 +57,7 @@ export function enhancePlaceLinks(markdown: string): string {
   );
 
   result = result.replace(
-    /([^\n\[\]]{2,80}?)クリックするとサイドパネルが開き、詳細が表示されます/g,
+    /([^\n[\]]{2,80}?)クリックするとサイドパネルが開き、詳細が表示されます/g,
     (_all, prefix: string) => {
       const before = String(prefix || "").trim();
       let matched = "";
@@ -75,7 +75,7 @@ export function enhancePlaceLinks(markdown: string): string {
 
   // ChatGPT: **店名**★ 3.5•カテゴリ / **店名**★ 3.5 · カテゴリ（地図下で連結される場合あり）
   result = result.replace(
-    /\*\*([^*\[\]\n]{2,80}?)\*\*\s*★\s*(\d(?:\.\d)?)\s*[·•]\s*([^\n★*]{0,80})/g,
+    /\*\*([^*[\]\n]{2,80}?)\*\*\s*★\s*(\d(?:\.\d)?)\s*[·•]\s*([^\n★*]{0,80})/g,
     (all, rawName: string, rating: string, category: string) => {
       const name = String(rawName || "").trim();
       if (!name || /https?:\/\//i.test(name) || /\]\(https?:/i.test(name)) return all;
@@ -86,7 +86,7 @@ export function enhancePlaceLinks(markdown: string): string {
 
   // ChatGPT: 太字なし 店名★ 3.5•カテゴリ（行頭）
   result = result.replace(
-    /(^|\n)([^\n\[\]*]{2,80}?)\s*★\s*(\d(?:\.\d)?)\s*[·•]\s*([^\n★]{0,80})/g,
+    /(^|\n)([^\n[\]*]{2,80}?)\s*★\s*(\d(?:\.\d)?)\s*[·•]\s*([^\n★]{0,80})/g,
     (all, lead: string, rawName: string, rating: string, category: string) => {
       const name = String(rawName || "").trim();
       if (!name || name.length < 2 || /https?:\/\//i.test(name) || /\]\(/.test(name)) return all;

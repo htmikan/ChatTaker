@@ -153,9 +153,10 @@ export async function saveChatPdfFromHtml(
 ): Promise<string> {
   await ensureFolder(app, folder);
   const path = uniquePath(app, folder, `${basename}.pdf`);
+  // Electron <webview> is not in HTMLElementTagNameMap; createEl typing rejects the tag name.
   const webview = host.ownerDocument.createElement("webview") as PdfWebview;
+  webview.classList.add("chattaker-print-webview");
   webview.setAttribute("partition", "persist:chattaker-print");
-  webview.style.cssText = "position:fixed;left:-12000px;top:0;width:900px;height:1200px;opacity:0;pointer-events:none;";
   host.appendChild(webview);
 
   try {

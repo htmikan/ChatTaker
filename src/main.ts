@@ -25,10 +25,6 @@ export default class ChatTakerPlugin extends Plugin {
     this.addSettingTab(new ChatTakerSettingTab(this.app, this));
   }
 
-  onunload(): void {
-    this.app.workspace.detachLeavesOfType(VIEW_TYPE_CHATTAKER);
-  }
-
   private async loadI18n(): Promise<void> {
     const dir = this.manifest.dir;
     if (!dir) return;
@@ -37,8 +33,9 @@ export default class ChatTakerPlugin extends Plugin {
       const adapter = this.app.vault.adapter;
       if (!(await adapter.exists(path))) return;
       loadI18nYaml(await adapter.read(path));
-    } catch (error) {
-      console.error("ChatTaker: i18n.yaml load failed", error);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("ChatTaker: i18n.yaml load failed", message);
     }
   }
 

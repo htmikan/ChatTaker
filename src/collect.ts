@@ -39,7 +39,7 @@ export interface CitationDebugRecord {
   jslogUrls: string[];
   noiseFiltered: string[];
   output: string;
-  outcome: "anchor" | "cite-name" | "jslog-multi" | "inner-anchor" | "empty" | string;
+  outcome: string;
   outerHtml?: string;
 }
 

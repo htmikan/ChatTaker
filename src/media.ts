@@ -134,13 +134,11 @@ async function saveMapHtmlIfPossible(
     extras.sourceUrl = media.sourceUrl;
   }
   if (!canBuildMapHtml(media)) {
-    console.info("[ChatTaker] map HTML skipped (insufficient info), PNG only", media.id);
     return Object.keys(extras).length ? extras : null;
   }
   try {
     const html = buildMapHtml(media);
     if (!html) {
-      console.info("[ChatTaker] map HTML skipped (build failed), PNG only", media.id);
       return Object.keys(extras).length ? extras : null;
     }
     const htmlName = pngPath.replace(/\.png$/i, ".html").split("/").pop()!;
@@ -148,10 +146,8 @@ async function saveMapHtmlIfPossible(
     const data = new TextEncoder().encode(html).buffer;
     await app.vault.createBinary(htmlPath, data);
     extras.htmlPath = htmlPath;
-    console.info("[ChatTaker] map HTML saved", htmlPath);
     return extras;
-  } catch (error) {
-    console.info("[ChatTaker] map HTML failed, PNG only", media.id, error);
+  } catch {
     return Object.keys(extras).length ? extras : null;
   }
 }

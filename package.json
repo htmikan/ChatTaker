@@ -1,6 +1,6 @@
 {
   "name": "chattaker",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Save official ChatGPT and Gemini web conversations to your vault—not an API chat client.",
   "main": "main.js",
   "scripts": {
@@ -12,7 +12,6 @@
   "devDependencies": {
     "@types/node": "^22.15.30",
     "@types/turndown": "^5.0.5",
-    "builtin-modules": "^5.0.0",
     "esbuild": "0.25.5",
     "obsidian": "latest",
     "tslib": "2.8.1",
