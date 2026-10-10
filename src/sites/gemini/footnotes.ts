@@ -2,8 +2,8 @@
  * Convert inline source links into Obsidian footnotes [^N] and build a reference list.
  * Keeps Maps search links and standalone homepage cards as normal Markdown links.
  */
-import type { CollectedMessage, CollectedSource } from "./collect";
-import { t } from "./i18n";
+import type { CollectedMessage, CollectedSource } from "../../collect";
+import { t } from "../../i18n";
 
 const SOURCE_CHROME_TAGS =
   "sources-carousel-inline|sources-carousel|structured-sources-block|sources-sidebar|sidebar-sources|model-thoughts|thoughts-animation";

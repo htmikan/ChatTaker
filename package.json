@@ -1,12 +1,14 @@
 {
   "name": "chattaker",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Save official ChatGPT and Gemini web conversations to your vault—not an API chat client.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "check": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production && node scripts/selfcheck.mjs"
+    "check": "node scripts/chatgpt-lock.mjs && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production && node scripts/selfcheck.mjs",
+    "lock:chatgpt": "node scripts/chatgpt-lock.mjs --write",
+    "golden": "node scripts/golden.mjs"
   },
   "license": "MIT",
   "devDependencies": {

@@ -1,5 +1,5 @@
 /**
- * ChatTaker page script — injected into the ChatGPT / Gemini webview.
+ * ChatTaker page script (Gemini) — injected into the gemini.google.com webview.
  *
  * Responsibilities:
  * - Walk the conversation DOM and sanitize it to simple HTML
@@ -228,179 +228,6 @@
     return urls;
   }
 
-  function urlsInAttributes(node) {
-    var urls = [];
-    function take(el) {
-      if (!el || !el.attributes) return;
-      for (var i = 0; i < el.attributes.length; i++) {
-        var attrName = String(el.attributes[i].name || '');
-        if (/^(src|srcset|poster|style)$/i.test(attrName)) continue;
-        var value = String(el.attributes[i].value || '');
-        if (value.indexOf('http') < 0) continue;
-        (value.match(/https?:\/\/[^\s"'<>\\]+/gi) || []).forEach(function (raw) {
-          var href = resolveHref(raw.replace(/[.,;:!?)]+$/g, ''));
-          if (href && !isNoiseSourceUrl(href) && urls.indexOf(href) < 0) urls.push(href);
-        });
-      }
-    }
-    take(node);
-    queryAllDeep(node, '*').slice(0, 40).forEach(take);
-    return urls;
-  }
-
-  var citationPopoverLinks = new Map();
-  var citationPopoverTried = new Set();
-
-  function popoverControlId(node) {
-    if (!node || node.nodeType !== 1) return '';
-    if (node.getAttribute && node.getAttribute('aria-controls')) return String(node.getAttribute('aria-controls') || '');
-    var triggers = queryAllDeep(node, '[aria-controls]');
-    return triggers.length ? String(triggers[0].getAttribute('aria-controls') || '') : '';
-  }
-
-  function cachedPopoverLinks(node) {
-    var id = popoverControlId(node);
-    if (id && citationPopoverLinks.has(id)) return citationPopoverLinks.get(id);
-    var name = normalizeCiteChipTitle(String((node && (node.innerText || node.textContent)) || '')).toLowerCase();
-    if (name && citationPopoverLinks.has('name:' + name)) return citationPopoverLinks.get('name:' + name);
-    return [];
-  }
-
-  function rememberPopoverLinks(id, name, links) {
-    if (!links || !links.length) return;
-    if (id) citationPopoverLinks.set(id, links);
-    if (name) citationPopoverLinks.set('name:' + name.toLowerCase(), links);
-  }
-
-  function popoverLinkTitle(el, href) {
-    var host = '';
-    try { host = new URL(href).hostname.replace(/^www\./i, '').toLowerCase(); } catch (e) {}
-    var leaves = [];
-    function take(text) {
-      String(text || '').split(/\n+/).forEach(function (line) {
-        var value = line.replace(/\s+/g, ' ').trim();
-        if (value.length < 2 || value.length > 160) return;
-        if (/^https?:\/\//i.test(value)) return;
-        var lower = value.toLowerCase();
-        if (host && (lower === host || lower === 'www.' + host)) return;
-        if (leaves.indexOf(value) < 0) leaves.push(value);
-      });
-    }
-    take(el && el.getAttribute ? (el.getAttribute('aria-label') || el.getAttribute('title') || '') : '');
-    if (el && el.querySelectorAll) {
-      el.querySelectorAll('h1,h2,h3,h4,p,span,div,a').forEach(function (child) {
-        if (child.children && child.children.length) return;
-        take(child.innerText || child.textContent || '');
-      });
-    }
-    take(el && (el.innerText || el.textContent) || '');
-    if (!leaves.length) return '';
-    leaves.sort(function (a, b) { return b.length - a.length; });
-    return leaves[0];
-  }
-
-  function linksFromPopoverPanel(panel) {
-    var out = [];
-    var seen = {};
-    function add(href, title) {
-      if (!href || seen[href] || isNoiseSourceUrl(href)) return;
-      seen[href] = true;
-      out.push({ href: href, title: title || href });
-    }
-    queryAllDeep(panel, 'a[href], [href], [data-href], [data-url], [data-source-url], [data-external-url], [data-absolute-url]').forEach(function (el) {
-      var href = resolveHrefFromNode(el);
-      if (!href) return;
-      add(href, popoverLinkTitle(el, href));
-    });
-    if (!out.length) {
-      urlsInAttributes(panel).forEach(function (href) { add(href, popoverLinkTitle(panel, href)); });
-    }
-    if (!out.length) {
-      var textUrl = firstHttpUrl(panel.innerText || panel.textContent || '');
-      if (textUrl) add(resolveHref(textUrl), popoverLinkTitle(panel, textUrl));
-    }
-    return out.slice(0, 8);
-  }
-
-  function findPopoverPanel(id) {
-    if (!id) return null;
-    var panel = document.getElementById(id);
-    if (panel) return panel;
-    var found = null;
-    queryAllDeep(document, '[id]').some(function (el) {
-      if (el.id === id) { found = el; return true; }
-      return false;
-    });
-    return found;
-  }
-
-  /** 閉じた出典バッジは DOM に URL が無い。保存中だけ開いてリンク題と URL を控える。 */
-  async function warmCitationPopovers() {
-    try {
-    var triggers = queryAllDeep(document, '[data-d-component="popover-trigger"][aria-controls], [aria-haspopup="dialog"][aria-controls]');
-    var opened = 0;
-    for (var i = 0; i < triggers.length && opened < 24; i++) {
-      var trigger = triggers[i];
-      if (!trigger || !trigger.isConnected || !trigger.getAttribute) continue;
-      if (trigger.tagName === 'A' || (trigger.closest && trigger.closest('a[href], form, nav, [data-message-actions]'))) continue;
-      var id = String(trigger.getAttribute('aria-controls') || '');
-      if (!id || citationPopoverTried.has(id)) continue;
-      var name = normalizeCiteChipTitle(String(trigger.innerText || trigger.textContent || '').replace(/\s+/g, ' ').trim());
-      if (!name || name.length > 80) continue;
-      if (citationPopoverLinks.has('name:' + name.toLowerCase())) {
-        citationPopoverTried.add(id);
-        rememberPopoverLinks(id, name, citationPopoverLinks.get('name:' + name.toLowerCase()));
-        continue;
-      }
-      var rect = trigger.getBoundingClientRect ? trigger.getBoundingClientRect() : null;
-      var vh = window.innerHeight || 0;
-      if (!rect || rect.width < 8 || rect.height < 8 || rect.bottom < 0 || rect.top > vh) continue;
-      citationPopoverTried.add(id);
-      var panel = findPopoverPanel(id);
-      var links = panel ? linksFromPopoverPanel(panel) : [];
-      if (!links.length && trigger.getAttribute('data-state') !== 'open') {
-        opened += 1;
-        try { trigger.click(); } catch (e) {}
-        for (var wait = 0; wait < 8 && !links.length; wait++) {
-          await delay(70);
-          panel = findPopoverPanel(id);
-          if (panel) links = linksFromPopoverPanel(panel);
-        }
-        try {
-          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
-        } catch (e) {}
-        await delay(40);
-        if (trigger.getAttribute('aria-expanded') === 'true') {
-          try { trigger.click(); } catch (e) {}
-          await delay(40);
-        }
-      }
-      rememberPopoverLinks(id, name, links);
-    }
-    } catch (e) {}
-  }
-
-  function formatPopoverLinks(links, fallbackTitle) {
-    return links.map(function (item) {
-      var label = item.title || fallbackTitle || item.href;
-      return '<a href="' + esc(item.href) + '">' + esc(label) + '</a>';
-    }).join('');
-  }
-
-  /** ChatGPT の出典バッジは URL を閉じた popover（aria-controls）側に持つ */
-  function popoverHref(node) {
-    var cached = cachedPopoverLinks(node);
-    if (cached.length) return cached[0].href;
-    if (!node || node.nodeType !== 1) return '';
-    var id = popoverControlId(node);
-    if (!id) return '';
-    var panel = findPopoverPanel(id);
-    if (!panel || panel === node) return '';
-    var links = linksFromPopoverPanel(panel);
-    if (links.length) return links[0].href;
-    return findHrefDeep(panel, 1);
-  }
-
   function findHrefDeep(node, depth) {
     if (!node) return '';
     var href = resolveHrefFromNode(node);
@@ -418,14 +245,8 @@
       return Boolean(found && !isNoiseSourceUrl(found));
     });
     if (found && !isNoiseSourceUrl(found)) return found;
-    var fromAttrs = urlsInAttributes(node);
-    if (fromAttrs.length) return fromAttrs[0];
     var fromLog = jslogUrlsDeep(node);
     if (fromLog.length) return fromLog[0];
-    if (!depth) {
-      var fromPopover = popoverHref(node);
-      if (fromPopover) return fromPopover;
-    }
     var blob = [
       node.getAttribute && node.getAttribute('aria-label'),
       node.getAttribute && node.getAttribute('title'),
@@ -647,12 +468,6 @@
       payloadCount: payloadSources.length,
       urlCard: keepCard,
     };
-    var popLinks = cachedPopoverLinks(node);
-    if (popLinks.length) {
-      var fromPopover = formatPopoverLinks(popLinks, title || citeName);
-      recordCitationDebug(node, fromPopover, 'popover', extra);
-      return fromPopover;
-    }
     if (payloadSources.length) {
       var fromPayload = payloadSources.map(function (item) {
         var label = item.title || title || citeName || item.url;
@@ -859,65 +674,10 @@
     });
   }
 
-  async function expandChatgptCitationPills(map) {
-    // クリック不要: payload 属性に URL が入っている
-    queryAllDeep(document, '[data-assistant-sources-payload], [data-assistant-sources-trigger]').forEach(function (el) {
-      parseAssistantSourcesPayload(el).forEach(function (item) {
-        addSource(map, item.title, item.url);
-      });
-    });
-    var pills = [];
-    var seen = new Set();
-    function addPill(el) {
-      if (!el || seen.has(el)) return;
-      seen.add(el);
-      pills.push(el);
-    }
-    queryAllDeep(
-      document,
-      '[data-testid="webpage-citation-pill"], [data-testid*="citation-pill"], [data-testid*="citation"], button[class*="footnote"], [data-assistant-sources-trigger]'
-    ).forEach(addPill);
-    queryAllDeep(document, 'button, a[href], [role="button"]').forEach(function (el) {
-      if (looksLikeCiteChipText(el) || /footnote|citation/i.test(classNameOf(el))) addPill(el);
-    });
-    // 会話内の target=_blank リンクは ChatGPT 引用の本体であることが多い
-    conversationSourceRoots().forEach(function (root) {
-      queryAllDeep(root, 'a[href][target="_blank"], a[href][rel*="noopener"]').forEach(function (el) {
-        var href = findHrefDeep(el);
-        var title = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-        addSource(map, normalizeCiteChipTitle(title) || title, href);
-      });
-      queryAllDeep(root, '[data-assistant-sources-payload]').forEach(function (el) {
-        parseAssistantSourcesPayload(el).forEach(function (item) {
-          addSource(map, item.title, item.url);
-        });
-      });
-    });
-    if (map.size > 0) return;
-    var limit = Math.min(pills.length, 10);
-    for (var i = 0; i < limit; i++) {
-      try {
-        var before = map.size;
-        var clickable = pills[i].querySelector
-          ? (pills[i].querySelector('a[href], button, [role="button"]') || pills[i])
-          : pills[i];
-        clickable.click();
-        await delay(350);
-        harvestOpenSourcePanels(map);
-        queryAllDeep(document, '[data-state="open"] a[href], [data-radix-popper-content-wrapper] a[href], [role="dialog"] a[href]').forEach(function (el) {
-          addSource(map, String(el.innerText || '').replace(/\s+/g, ' ').trim(), findHrefDeep(el));
-        });
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-        await delay(120);
-        if (map.size === before && i > 2 && map.size > 0) break;
-      } catch (e) {}
-    }
-  }
-
   function conversationSourceRoots() {
     var roots = queryAllDeep(
       document,
-      'main, [role="main"], [data-testid="conversation"], [data-testid*="conversation"], .conversation, user-query, model-response, [data-message-author-role], [data-message-role]'
+      'main, [role="main"], [data-testid="conversation"], [data-testid*="conversation"], .conversation, user-query, model-response'
     );
     var filtered = [];
     var seen = [];
@@ -942,10 +702,6 @@
     var roots = conversationSourceRoots();
     if (roots.length) roots.forEach(function (root) { collectSourcesFromRoot(root, map); });
     await tryCollectFromSourcesFlyout(map);
-    // ChatGPT: インライン引用 pill を開いて URL を回収
-    if (location.hostname.indexOf('chatgpt.com') >= 0 || location.hostname.indexOf('chat.openai.com') >= 0) {
-      await expandChatgptCitationPills(map);
-    }
     var sources = [];
     map.forEach(function (title, url) {
       sources.push({ title: title, url: url });
@@ -1160,8 +916,6 @@
     mediaMeta.clear();
     mediaSeq = 0;
     captureClaimed.clear();
-    citationPopoverLinks.clear();
-    citationPopoverTried.clear();
   }
 
   function registerMedia(el, kind, extra) {
@@ -1500,8 +1254,6 @@
     }
     if (tag === 'BUTTON' || (node.getAttribute && node.getAttribute('role') === 'button')) {
       if (isCitationPill(node)) return linkFromCitation(node);
-      var buttonPop = cachedPopoverLinks(node);
-      if (buttonPop.length) return formatPopoverLinks(buttonPop, plainText(inner));
       if (isActionControl(node)) return '';
       if (/data-ct-media=/.test(inner)) return inner;
       var buttonLabel = plainText(inner);
@@ -1904,7 +1656,6 @@
         if (!drive.started) {
           await delay(160);
           if (!drive || drive.epoch !== window.__ctEpoch) return { done: true, rects: [] };
-          if (api.warmCitations) await api.warmCitations();
           api.harvest();
           await snapshotMediaBytes();
           drive.started = true;
@@ -1917,7 +1668,6 @@
         sc.scrollTop = before + Math.max(240, Math.floor(sc.clientHeight * 0.7));
         await delay(160);
         if (!drive || drive.epoch !== window.__ctEpoch) return { done: true, rects: [] };
-        if (api.warmCitations) await api.warmCitations();
         api.harvest();
         await snapshotMediaBytes();
         var atEnd = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 4;
@@ -2022,269 +1772,6 @@
   };
 
   // --- Site installers: observe the conversation and export via __ctCollect ---
-
-  function installChatGPT() {
-    var specific = '[data-message-author-role], [data-message-role="user"], [data-message-role="assistant"], [data-turn="user"], [data-turn="assistant"]';
-    var fallback = '[data-testid*="conversation-turn"], [class*="agent-turn"], [class*="conversation-turn"]';
-    var collected = new Map();
-    var session = nextSession();
-    var conv = convId();
-    var fullScanned = !conv;
-    var scanning = false;
-    var scanToken = 0;
-
-    function convId() {
-      var path = location.pathname || '';
-      var chat = /\/(?:c|uc)\/([^/]+)/.exec(path);
-      if (chat) return chat[1];
-      var share = /\/share\/([^/]+)/.exec(path);
-      if (share) return 'share:' + share[1];
-      return '';
-    }
-
-    function roleOf(el) {
-      function raw(node) {
-        if (!node || !node.getAttribute) return '';
-        return (node.getAttribute('data-message-author-role') || node.getAttribute('data-message-role') || node.getAttribute('data-turn') || node.getAttribute('data-author') || '').toLowerCase();
-      }
-      var role = raw(el);
-      if (!role) {
-        var inner = el.querySelector('[data-message-author-role], [data-message-role], [data-turn]');
-        role = raw(inner);
-      }
-      if (role.indexOf('user') >= 0) return 'user';
-      if (role.indexOf('assistant') >= 0) return 'assistant';
-      var className = typeof el.className === 'string' ? el.className : '';
-      var blob = ((el.getAttribute('data-testid') || '') + ' ' + className).toLowerCase();
-      if (blob.indexOf('user') >= 0 && blob.indexOf('assistant') < 0) return 'user';
-      return 'assistant';
-    }
-
-    function add(el) {
-      var message = buildMessage(el, roleOf(el));
-      if (!message) return;
-      stampMedia(message, el);
-      var id = el.getAttribute('data-message-id') || el.getAttribute('data-turn-id') || el.getAttribute('data-canonical-dil-message-id');
-      var key = id || (message.role + '\n' + plainText(message.html));
-      rememberMessage(collected, key, message);
-    }
-
-    function harvest(selector) {
-      var docs = allDocs();
-      docs.forEach(function (doc) {
-        outermost(queryAllDeep(doc, selector)).forEach(add);
-      });
-    }
-
-    async function fullScan() {
-      if (fullScanned || !convId()) return;
-      var token = ++scanToken;
-      var scanSession = session;
-      fullScanned = true;
-      scanning = true;
-      var sc = null;
-      var prev = 0;
-      try {
-        var seed = queryAllDeep(document, specific)[0] || document.querySelector('main');
-        sc = findScroller(document, seed);
-        prev = sc ? sc.scrollTop : 0;
-        collected.clear();
-        resetMedia();
-        if (sc) {
-          sc.scrollTop = 0;
-          await delay(150);
-          if (session !== scanSession || window.__ctEpoch !== epoch) return;
-          harvest(specific);
-          await snapshotMediaBytes();
-          var stuck = 0;
-          for (var i = 0; i < 60; i++) {
-            if (session !== scanSession || window.__ctEpoch !== epoch) return;
-            var before = sc.scrollTop;
-            var step = Math.max(240, Math.floor(sc.clientHeight * 0.7));
-            sc.scrollTop = before + step;
-            await delay(100);
-            harvest(specific);
-            await snapshotMediaBytes();
-            var atEnd = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 4;
-            if (sc.scrollTop === before) {
-              if (atEnd || ++stuck >= 3) break;
-            } else {
-              stuck = 0;
-            }
-            if (atEnd) break;
-          }
-        } else {
-          harvest(specific);
-          await snapshotMediaBytes();
-        }
-        if (!collected.size && session === scanSession) harvest(fallback);
-        await snapshotMediaBytes();
-      } catch (e) {
-      } finally {
-        if (session === scanSession && sc) sc.scrollTop = prev;
-        if (scanToken === token) scanning = false;
-      }
-    }
-
-    function beginConversation() {
-      session = nextSession();
-      collected.clear();
-      resetMedia();
-      fullScanned = false;
-      scanning = false;
-      scanToken += 1;
-      if (conv) void fullScan();
-      else fullScanned = true;
-    }
-
-    function noteNavigation() {
-      var next = convId();
-      if (next === conv) return;
-      var prev = conv;
-      var had = collected.size;
-      conv = next;
-      if (!prev && next && had > 0) {
-        collected.clear();
-        resetMedia();
-        harvest(specific);
-        fullScanned = true;
-        return;
-      }
-      beginConversation();
-    }
-
-    function plainFallback() {
-      if (collected.size) return;
-      var main = document.querySelector('main') || document.body;
-      var text = main ? (main.innerText || '').replace(/\u00a0/g, ' ').trim() : '';
-      if (text.length < 20) return;
-      collected.set('fallback-main', { role: '', html: '<p>' + esc(text) + '</p>', media: [] });
-    }
-
-    function snapshot() {
-      var items = [];
-      collected.forEach(function (item) {
-        items.push({ role: item.role, html: item.html, media: item.media || [] });
-      });
-      return {
-        session: session,
-        url: location.href,
-        title: document.title || 'ChatGPT',
-        streaming: isStreaming(),
-        scanning: scanning,
-        items: items
-      };
-    }
-
-    window.__ctReset = function () {
-      conv = '';
-      session = nextSession();
-      collected.clear();
-      resetMedia();
-      fullScanned = true;
-      scanning = false;
-      scanToken += 1;
-    };
-
-    window.__ctExport = function () {
-      noteNavigation();
-      if (!scanning && !collected.size) harvest(specific);
-      if (!scanning && !collected.size) harvest(fallback);
-      return snapshot();
-    };
-
-    async function exportForSave() {
-      if (!collected.size) harvest(specific);
-      if (!collected.size) harvest(fallback);
-      if (!collected.size) plainFallback();
-      var exported = snapshot();
-      exported.streaming = false;
-      exported.scanning = false;
-      exported.sources = await collectSourcesForSave(collected);
-      var debug = buildPageDebugPayload(exported);
-      if (debug) exported.debug = debug;
-      return exported;
-    }
-
-    var saveDrive = createSaveDrive({
-      reset: function () {
-        noteNavigation();
-        resetDebugCitations();
-        session = nextSession();
-        collected.clear();
-        resetMedia();
-        scanToken += 1;
-        fullScanned = true;
-        scanning = true;
-      },
-      seed: function () {
-        return queryAllDeep(document, specific)[0] || document.querySelector('main');
-      },
-      harvest: function () { harvest(specific); },
-      warmCitations: warmCitationPopovers,
-      stopScanning: function () { scanning = false; },
-      exportPayload: exportForSave,
-    });
-    window.__ctBeginSave = function () { return saveDrive.begin(); };
-    window.__ctSaveStep = function () { return saveDrive.step(); };
-    window.__ctFinishSave = function () { return saveDrive.finish(); };
-
-    window.__ctSave = async function () {
-      noteNavigation();
-      resetDebugCitations();
-      collected.clear();
-      resetMedia();
-      scanToken += 1;
-      scanning = false;
-      fullScanned = false;
-      if (convId()) await fullScan();
-      return exportForSave();
-    };
-
-    window.__ctNoteNavigation = noteNavigation;
-    if (!window.__ctHistoryPatched) {
-      window.__ctHistoryPatched = true;
-      var pushState = history.pushState;
-      var replaceState = history.replaceState;
-      history.pushState = function () {
-        var result = pushState.apply(this, arguments);
-        if (window.__ctNoteNavigation) window.__ctNoteNavigation();
-        return result;
-      };
-      history.replaceState = function () {
-        var result = replaceState.apply(this, arguments);
-        if (window.__ctNoteNavigation) window.__ctNoteNavigation();
-        return result;
-      };
-      window.addEventListener('popstate', function () {
-        if (window.__ctNoteNavigation) window.__ctNoteNavigation();
-      });
-    }
-    var harvestTimer = 0;
-    var observer = new MutationObserver(function () {
-      if (window.__ctEpoch !== epoch) return;
-      noteNavigation();
-      if (scanning || harvestTimer) return;
-      harvestTimer = window.setTimeout(function () {
-        harvestTimer = 0;
-        if (!scanning && window.__ctEpoch === epoch) harvest(specific);
-      }, 200);
-    });
-    observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
-    var navTimer = window.setInterval(function () {
-      if (window.__ctEpoch === epoch) noteNavigation();
-    }, 400);
-    disposers.push(function () {
-      observer.disconnect();
-      window.clearInterval(navTimer);
-      window.clearTimeout(harvestTimer);
-    });
-
-    if (!window.__ctSaving) {
-      if (conv) void fullScan();
-      else harvest(specific);
-    }
-  }
 
   function installGemini() {
     var collected = new Map();
@@ -2421,7 +1908,6 @@
         return queryAllDeep(document, 'user-query, model-response')[0] || document.querySelector('main');
       },
       harvest: function () { harvestGemini(); },
-      warmCitations: warmCitationPopovers,
       stopScanning: function () { scanning = false; },
       exportPayload: exportForSave,
     });
@@ -2460,7 +1946,6 @@
     }
   }
 
-  if (location.hostname.indexOf('gemini.google') >= 0) installGemini();
-  else installChatGPT();
+  installGemini();
   return 0;
 })();

@@ -1,7 +1,7 @@
 {
   "id": "chattaker",
   "name": "ChatTaker",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "minAppVersion": "1.7.2",
   "description": "Save official ChatGPT and Gemini web conversations to your vault—not an API chat client.",
   "author": "htmikan",

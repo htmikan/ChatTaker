@@ -4,21 +4,32 @@
  */
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
-import type { CollectedMessage, CollectedSource } from "./collect";
-import { idField, type ChatSite } from "./filename";
+import type { CollectedMessage, CollectedSource } from "../../collect";
+import { idField, type ChatSite } from "../../filename";
 import {
   applyFootnoteMarkers,
   collectSources,
   formatSourcesMarkdown,
   replaceSourceLinksInHtml,
   replaceSourceLinksInMarkdown,
+  stripSponsoredAds,
 } from "./footnotes";
 import { stripPromptFromMarkdown, stripResponseLabelsHtml } from "./labels";
-import type { MediaExtras } from "./media";
+import type { MediaExtras } from "../../media";
 import { enhancePlaceLinks } from "./places";
-import { t } from "./i18n";
+import { embedPath, expandMathInHtml, formatMediaMarkdown, formatObsidianMath, formatSavedAt } from "../../note-common";
 
-export { formatSourcesMarkdown, replaceSourceLinksInHtml, replaceSourceLinksInMarkdown };
+export {
+  collectSources,
+  embedPath,
+  expandMathInHtml,
+  formatMediaMarkdown,
+  formatObsidianMath,
+  formatSavedAt,
+  formatSourcesMarkdown,
+  replaceSourceLinksInHtml,
+  replaceSourceLinksInMarkdown,
+};
 
 const turndown = new TurndownService({
   headingStyle: "atx",
@@ -88,46 +99,6 @@ function nextMeaningfulSibling(node: Node): Node | null {
   return null;
 }
 
-/** Emit Obsidian $...$ / $$...$$ math from extracted LaTeX. */
-export function formatObsidianMath(latex: string, display = false): string {
-  const body = stripMathDelimiters(latex);
-  if (!body) return "";
-  if (display) return `\n\n$$\n${body}\n$$\n\n`;
-  return `$${body}$`;
-}
-
-/** Expand data-ct-math spans into visible math markup for PDF HTML. */
-export function expandMathInHtml(html: string): string {
-  return html.replace(/<span\b([^>]*)>([\s\S]*?)<\/span>/gi, (all, attrs: string, inner: string) => {
-    const mode = /\bdata-ct-math\s*=\s*"(display|inline)"/i.exec(attrs);
-    if (!mode) return all;
-    const latex = decodeHtmlEntities(inner).trim();
-    if (!latex) return "";
-    const formatted = formatObsidianMath(latex, mode[1] === "display").trim();
-    if (mode[1] === "display") return `<div class="math-display">${escapeHtmlText(formatted)}</div>`;
-    return `<span class="math-inline">${escapeHtmlText(formatted)}</span>`;
-  });
-}
-
-function stripMathDelimiters(latex: string): string {
-  const value = latex.trim();
-  if (/^\$\$[\s\S]*\$\$$/.test(value)) return value.replace(/^\$\$/, "").replace(/\$\$$/, "").trim();
-  if (value.length >= 2 && value.startsWith("$") && value.endsWith("$") && !value.startsWith("$$")) {
-    return value.slice(1, -1).trim();
-  }
-  if (value.startsWith("\\(") && value.endsWith("\\)")) return value.slice(2, -2).trim();
-  if (value.startsWith("\\[") && value.endsWith("\\]")) return value.slice(2, -2).trim();
-  return value;
-}
-
-function decodeHtmlEntities(value: string): string {
-  return value.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-}
-
-function escapeHtmlText(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 /**
  * ChatGPT の表セルは div / p 入りで、Turndown がセル内改行にして表を壊す。
  * リンク以外のブロックを1行に畳む。
@@ -150,9 +121,16 @@ export function htmlToMarkdown(html: string): string {
 }
 
 /** Drop chrome-only messages and strip repeated UI labels from HTML. */
+function withoutSponsoredAds(message: CollectedMessage): CollectedMessage {
+  const html = stripSponsoredAds(message.html || "", message.role);
+  if (html === (message.html || "")) return message;
+  const media = (message.media ?? []).filter((item) => html.includes(`data-ct-media="${item.id}"`));
+  return { ...message, html, media };
+}
+
 export function prepareMessages(messages: CollectedMessage[]): CollectedMessage[] {
   const kept: CollectedMessage[] = [];
-  for (const message of messages) {
+  for (const message of messages.map(withoutSponsoredAds)) {
     if (isChromeHtml(message.html)) continue;
     const text = textFromHtml(message.html);
     const hasMedia = messageHasMedia(message);
@@ -162,19 +140,72 @@ export function prepareMessages(messages: CollectedMessage[]): CollectedMessage[
       if (kept[index].role !== message.role) continue;
       const previous = textFromHtml(kept[index].html);
       if (!text && hasMedia) break;
-      if (previous === text || (text && previous && text.includes(previous))) {
-        kept[index] = message;
-        absorbed = true;
-        break;
-      }
-      if (previous && text && previous.includes(text) && !hasMedia) {
-        absorbed = true;
-        break;
-      }
+      if (!sameTurnText(previous, text)) continue;
+      const preferIncoming = text.length > previous.length;
+      const primary = preferIncoming ? message : kept[index];
+      const extra = preferIncoming ? kept[index] : message;
+      kept[index] = mergeTurnMedia(primary, extra);
+      absorbed = true;
+      break;
     }
     if (!absorbed) kept.push(message);
   }
   return kept;
+}
+
+/**
+ * ChatGPT はスクロールで同じ回答を別ノードとして出し直す。
+ * 引用の開き方で数語だけ違うので、完全一致だけでなく本文の重なりでも1件にまとめる。
+ */
+function sameTurnText(previous: string, text: string): boolean {
+  if (!previous || !text) return false;
+  if (previous === text || previous.includes(text) || text.includes(previous)) return true;
+  const left = previous.replace(/\s+/g, "");
+  const right = text.replace(/\s+/g, "");
+  const shorter = left.length <= right.length ? left : right;
+  const longer = left.length <= right.length ? right : left;
+  if (shorter.length < 120 || shorter.length / longer.length < 0.6) return false;
+  return shingleRatio(shorter, longer) >= 0.85;
+}
+
+function shingleRatio(shorter: string, longer: string): number {
+  const size = 40;
+  const step = 20;
+  if (shorter.length < size) return longer.includes(shorter) ? 1 : 0;
+  let total = 0;
+  let hit = 0;
+  for (let index = 0; index + size <= shorter.length; index += step) {
+    total += 1;
+    if (longer.includes(shorter.slice(index, index + size))) hit += 1;
+  }
+  return total ? hit / total : 0;
+}
+
+function mergeTurnMedia(primary: CollectedMessage, extra: CollectedMessage): CollectedMessage {
+  const media = (primary.media ?? []).map((item) => ({ ...item }));
+  const byId = new Map(media.map((item) => [item.id, item]));
+  let html = primary.html || "";
+  let changed = false;
+  for (const item of extra.media ?? []) {
+    const existing = byId.get(item.id);
+    if (existing) {
+      if (!existing.base64 && item.base64) {
+        existing.base64 = item.base64;
+        existing.mime = item.mime || existing.mime;
+        changed = true;
+      }
+      continue;
+    }
+    if (item.src && media.some((entry) => entry.src === item.src)) continue;
+    media.push(item);
+    byId.set(item.id, item);
+    changed = true;
+    if (!html.includes(`data-ct-media="${item.id}"`)) {
+      html += `<img data-ct-media="${item.id.replace(/"/g, "")}" alt="">`;
+    }
+  }
+  if (!changed) return primary;
+  return { ...primary, html, media };
 }
 
 /**
@@ -251,33 +282,6 @@ function pruneUnusedFootnotes(
   return { body: rewritten, sources: next };
 }
 
-/** ISO-ish local datetime for the note frontmatter `datetime` field. */
-export function formatSavedAt(date: Date): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-}
-
-export function embedPath(path: string): string {
-  return `![[${path.replace(/\\/g, "/")}]]`;
-}
-
-/** Replace %%CGM_MEDIA:id%% placeholders with wiki embeds / map links. */
-export function formatMediaMarkdown(
-  id: string,
-  mediaPaths: Map<string, string>,
-  mediaExtras: Map<string, MediaExtras> = new Map(),
-): string {
-  const path = mediaPaths.get(id);
-  if (!path) return "";
-  const lines = [embedPath(path)];
-  const extras = mediaExtras.get(id);
-  const links: string[] = [];
-  if (extras?.htmlPath) links.push(`[${t("media.rebuiltMap")}](${pathToLink(extras.htmlPath)})`);
-  if (extras?.sourceUrl) links.push(`[${t("media.openOriginal")}](${extras.sourceUrl})`);
-  if (links.length) lines.push(links.join(" · "));
-  return lines.join("\n\n");
-}
-
 function applyMediaPaths(
   markdown: string,
   mediaPaths: Map<string, string>,
@@ -294,10 +298,6 @@ function applyMediaPaths(
     .map((id) => formatMediaMarkdown(id, mediaPaths, mediaExtras));
   if (orphans.length) result = `${orphans.join("\n\n")}${result ? `\n\n${result}` : ""}`;
   return result.replace(/\n{3,}/g, "\n\n").trim();
-}
-
-function pathToLink(path: string): string {
-  return path.replace(/\\/g, "/").replace(/ /g, "%20");
 }
 
 function asQuestionCallout(markdown: string): string {

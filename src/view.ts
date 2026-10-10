@@ -5,7 +5,8 @@
 import { ItemView, Notice, Platform, TFolder, Vault, WorkspaceLeaf } from "obsidian";
 import type ChatTakerPlugin from "./main";
 import { PLUGIN_ICON_ID } from "./icon";
-import { asCollectedChat, collectScript, type CollectedChat } from "./collect";
+import { asCollectedChat, type CollectedChat } from "./collect";
+import { buildNote, getSiteModule } from "./sites";
 import {
   conversationId,
   filenameTemplateFor,
@@ -17,7 +18,6 @@ import {
   withUniqueSuffix,
   type ChatSite,
 } from "./filename";
-import { buildNote } from "./markdown";
 import { collectChatWithCaptures, loadCollectedMediaData, saveCollectedMedia, type CaptureRect, type MediaWebview } from "./media";
 import { buildPrintHtml, saveChatPdfFromHtml } from "./pdf";
 import { asSaveFormat, DEFAULT_SETTINGS, type SaveFormat } from "./settings";
@@ -215,7 +215,7 @@ export class ChatTakerView extends ItemView {
   private async inject(): Promise<void> {
     if (!this.webview) return;
     try {
-      await this.webview.executeJavaScript(collectScript);
+      await this.webview.executeJavaScript(getSiteModule(this.site).collectScript);
     } catch (error) {
       console.error("ChatTaker: inject failed", error);
     }
@@ -268,12 +268,14 @@ export class ChatTakerView extends ItemView {
     const basename = this.nextBasename(folder, savedAt, site, "md");
     const attachmentFolder = `${folder}/attachments`;
     this.setStatus(t("view.savingImages"));
-    const media = await saveCollectedMedia(this.app, this.webview, data, attachmentFolder, basename);
+    // Download media only for the turns that will end up in the note (no duplicate / ad images).
+    const kept = { ...data, items: getSiteModule(site).prepareMessages(data.items) };
+    const media = await saveCollectedMedia(this.app, this.webview, kept, attachmentFolder, basename);
     const note = buildNote({
       site,
       conversationId: conversationId(data.url),
       source: data.url,
-      messages: data.items,
+      messages: kept.items,
       savedAt,
       mediaPaths: media.paths,
       mediaExtras: media.extras,
@@ -293,6 +295,7 @@ export class ChatTakerView extends ItemView {
       basename,
       data,
       noteMarkdown: note,
+      mediaRoutes: media.routes,
     });
     const extra = mediaExtra(media.saved, media.failed);
     const debugExtra = debugPath ? t("view.debug", { path: debugPath }) : "";
@@ -314,12 +317,13 @@ export class ChatTakerView extends ItemView {
     const folder = this.folderPath();
     const basename = this.nextBasename(folder, savedAt, site, "pdf");
     this.setStatus(t("view.loadingImages"));
-    const media = await loadCollectedMediaData(this.webview, data);
+    const kept = { ...data, items: getSiteModule(site).prepareMessages(data.items) };
+    const media = await loadCollectedMediaData(this.webview, kept);
     const html = buildPrintHtml({
       site,
       source: data.url,
       title: data.title,
-      messages: data.items,
+      messages: kept.items,
       mediaDataUrls: media.dataUrls,
       savedAt,
       sources: data.sources,
@@ -365,6 +369,7 @@ export class ChatTakerView extends ItemView {
     basename: string;
     data: CollectedChat;
     noteMarkdown?: string | null;
+    mediaRoutes?: Map<string, string>;
   }): Promise<string | null> {
     if (!this.plugin.settings.debugCitations) return null;
     const dump = buildCitationDebugDump({
@@ -373,6 +378,7 @@ export class ChatTakerView extends ItemView {
       savedAt: input.savedAt,
       data: input.data,
       noteMarkdown: input.noteMarkdown,
+      mediaRoutes: input.mediaRoutes,
     });
     return writeCitationDebugDump(this.app.vault, input.folder, input.basename, dump);
   }
@@ -381,7 +387,11 @@ export class ChatTakerView extends ItemView {
   private async collectForSave(): Promise<CollectedChat | null> {
     const webview = this.webview;
     if (!webview) return null;
-    const raw = await collectChatWithCaptures(webview, collectScript, this.plugin.settings.debugCitations);
+    const raw = await collectChatWithCaptures(
+      webview,
+      getSiteModule(this.site).collectScript,
+      this.plugin.settings.debugCitations,
+    );
     return asCollectedChat(raw);
   }
 

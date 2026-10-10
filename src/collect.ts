@@ -1,10 +1,7 @@
 /**
  * Types and helpers for chat payloads returned by the injected page script.
- * `collectScript` is the raw JS source of collect-page.txt (injected into the webview).
+ * The page scripts themselves live per site under src/sites/<site>/page.txt.
  */
-import collectScript from "./collect-page.txt";
-
-export { collectScript };
 
 export type CollectedMediaKind = "image" | "capture" | "map";
 
@@ -80,7 +77,10 @@ export interface CitationDebugDump {
     src?: string;
     hasBytes: boolean;
     ordinal?: number;
+    /** Acquisition route when the note was saved: page-fetch, host-request, screenshot, … */
+    via?: string;
   }>;
+  overlays?: Array<Record<string, unknown>>;
 }
 
 export interface CollectedMessage {
@@ -99,6 +99,8 @@ export interface CollectedChat {
   sources?: CollectedSource[];
   debug?: {
     citations?: CitationDebugRecord[];
+    /** Popups / drawers the page script hid or removed before screenshots (ChatGPT only). */
+    overlays?: Array<Record<string, unknown>>;
     summary?: Record<string, number>;
   };
 }
@@ -227,7 +229,14 @@ function asDebugPayload(value: unknown): CollectedChat["debug"] | undefined {
       if (typeof num === "number" && Number.isFinite(num)) summary[key] = num;
     }
   }
-  return { citations, summary };
+  const overlays: Array<Record<string, unknown>> = [];
+  const rawOverlays = (value as { overlays?: unknown }).overlays;
+  if (Array.isArray(rawOverlays)) {
+    for (const item of rawOverlays) {
+      if (item && typeof item === "object" && overlays.length < 40) overlays.push(item as Record<string, unknown>);
+    }
+  }
+  return { citations, summary, overlays };
 }
 
 function parseJson(value: string): unknown {

@@ -16,6 +16,7 @@ export function buildCitationDebugDump(input: {
   savedAt: Date;
   data: CollectedChat;
   noteMarkdown?: string | null;
+  mediaRoutes?: Map<string, string>;
 }): CitationDebugDump {
   const pageDebug = input.data.debug;
   const citations: CitationDebugRecord[] = Array.isArray(pageDebug?.citations) ? pageDebug.citations : [];
@@ -60,8 +61,10 @@ export function buildCitationDebugDump(input: {
         src: entry.src ? entry.src.slice(0, 180) : undefined,
         hasBytes: Boolean(entry.base64),
         ordinal: entry.ordinal,
+        via: input.mediaRoutes?.get(entry.id),
       })),
     ),
+    overlays: Array.isArray(pageDebug?.overlays) ? pageDebug.overlays : undefined,
     footnotes: {
       markerCount: footnoteMarkers,
       definitionCount: footnoteDefs,

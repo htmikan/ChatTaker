@@ -3,8 +3,8 @@
  */
 import type { App } from "obsidian";
 import type { CollectedMessage, CollectedSource } from "./collect";
-import { collectSources } from "./footnotes";
-import { prepareMessages, formatSavedAt, replaceSourceLinksInHtml, expandMathInHtml } from "./markdown";
+import { formatSavedAt } from "./note-common";
+import { getSiteModule } from "./sites";
 import type { ChatSite } from "./filename";
 import { t } from "./i18n";
 import { createWebviewEl } from "./webview";
@@ -30,6 +30,7 @@ export function buildPrintHtml(input: {
   sources?: CollectedSource[];
 }): string | null {
   const mediaDataUrls = input.mediaDataUrls ?? new Map<string, string>();
+  const { collectSources, prepareMessages, replaceSourceLinksInHtml, expandMathInHtml } = getSiteModule(input.site);
   const sources = collectSources(input.sources ?? [], input.messages);
   const sections = prepareMessages(input.messages)
     .map((message) => {

@@ -1,0 +1,2852 @@
+/**
+ * ChatTaker page script (ChatGPT) — injected into the chatgpt.com webview.
+ *
+ * Responsibilities:
+ * - Walk the conversation DOM and sanitize it to simple HTML
+ * - Resolve citation pills / jslog / sources payloads into real URLs
+ * - Register images, map widgets, and screenshot captures as media
+ * - Detect place cards and emit Maps search links when possible
+ * - Expose window.__ctCollect() so the Obsidian side can pull a payload
+ *
+ * This file is loaded as a string (collect-page.txt) and executed via
+ * webview.executeJavaScript — it is not a Node/TypeScript module.
+ */
+(function () {
+  if (typeof window.__ctDispose === 'function') {
+    try { window.__ctDispose(); } catch (e) {}
+  }
+  var epoch = (window.__ctEpoch || 0) + 1;
+  window.__ctEpoch = epoch;
+  window.__ctInstalled = true;
+  var disposers = [];
+  window.__ctDispose = function () {
+    window.__ctNoteNavigation = null;
+    var list = disposers.slice();
+    disposers = [];
+    list.forEach(function (fn) {
+      try { fn(); } catch (e) {}
+    });
+  };
+
+  var mediaElements = new Map();
+  var mediaMeta = new Map();
+  var mediaSeq = 0;
+  var debugCitationRecords = [];
+  var overlayLog = [];
+  var hiddenForCapture = [];
+
+  // --- Citation debug (optional sidecar JSON) ---
+
+  function debugCitationsEnabled() {
+    return Boolean(window.__ctDebugCitations);
+  }
+
+  function resetDebugCitations() {
+    debugCitationRecords = [];
+    overlayLog = [];
+  }
+
+  function clipDebug(value, max) {
+    var text = String(value || '');
+    return text.length <= max ? text : text.slice(0, max) + '…';
+  }
+
+  function recordCitationDebug(node, output, outcome, extra) {
+    if (!debugCitationsEnabled() || debugCitationRecords.length >= 40) return;
+    var aria = '';
+    if (node && node.getAttribute) aria = node.getAttribute('aria-label') || '';
+    if (!aria && node && node.querySelector) {
+      var labeled = node.querySelector('[aria-label]');
+      if (labeled) aria = labeled.getAttribute('aria-label') || '';
+    }
+    var jslog = node && node.getAttribute ? (node.getAttribute('jslog') || '') : '';
+    if (!jslog && node) {
+      var withLog = queryAllDeep(node, '[jslog]')[0];
+      if (withLog) jslog = withLog.getAttribute('jslog') || '';
+    }
+    var hrefAttr = node && node.getAttribute ? (node.getAttribute('href') || '') : '';
+    var dataHref = node && node.getAttribute ? (node.getAttribute('data-href') || '') : '';
+    var dataUrl = node && node.getAttribute ? (node.getAttribute('data-url') || '') : '';
+    var noiseFiltered = (extra && extra.noiseFiltered) || [];
+    debugCitationRecords.push({
+      tag: String(node && node.tagName || ''),
+      className: classNameOf(node),
+      ariaLabel: clipDebug(aria, 200),
+      attrs: {
+        href: hrefAttr || undefined,
+        dataHref: dataHref || undefined,
+        dataUrl: dataUrl || undefined,
+        hasJslog: Boolean(jslog),
+        jslogPreview: jslog ? clipDebug(jslog, 300) : undefined,
+      },
+      resolvedHref: (extra && extra.resolvedHref) || '',
+      jslogUrls: (extra && extra.jslogUrls) || [],
+      noiseFiltered: noiseFiltered,
+      output: clipDebug(output, 300),
+      outcome: outcome || 'empty',
+      outerHtml: node && node.outerHTML ? clipDebug(node.outerHTML, 800) : undefined,
+    });
+  }
+
+  function buildPageDebugPayload(exported) {
+    if (!debugCitationsEnabled()) return undefined;
+    var html = '';
+    (exported.items || []).forEach(function (item) { html += item.html || ''; });
+    var anchors = (html.match(/<a\b/gi) || []).length;
+    var citeNames = (html.match(/data-ct-cite-name=/gi) || []).length;
+    return {
+      citations: debugCitationRecords.slice(),
+      overlays: overlayLog.slice(),
+      summary: {
+        pageCitations: debugCitationRecords.length,
+        pageAnchors: anchors,
+        pageCiteNames: citeNames,
+        pageSources: (exported.sources || []).length,
+      },
+    };
+  }
+
+  function nextSession() {
+    var current = Number(sessionStorage.getItem('ct-session') || '0');
+    var next = current + 1;
+    sessionStorage.setItem('ct-session', String(next));
+    return next;
+  }
+
+  function delay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  // --- DOM helpers (shadow roots, outermost nodes, URL cleanup) ---
+
+  function queryAllDeep(root, selector) {
+    var found = [];
+    var seen = new Set();
+    function visit(node) {
+      if (!node || seen.has(node) || !node.querySelectorAll) return;
+      seen.add(node);
+      node.querySelectorAll(selector).forEach(function (el) { found.push(el); });
+      node.querySelectorAll('*').forEach(function (el) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      });
+    }
+    visit(root);
+    return found;
+  }
+
+  function allDocs() {
+    var docs = [document];
+    document.querySelectorAll('iframe').forEach(function (frame) {
+      try {
+        if (frame.contentDocument) docs.push(frame.contentDocument);
+      } catch (e) {}
+    });
+    return docs;
+  }
+
+  function outermost(nodes) {
+    return nodes.filter(function (el) {
+      return !nodes.some(function (other) { return other !== el && other.contains(el); });
+    });
+  }
+
+  function esc(value) {
+    return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function resolveHref(href) {
+    var value = String(href || '').trim();
+    if (!value || value === '#' || /^javascript:/i.test(value) || /^mailto:/i.test(value) || /^data:/i.test(value)) return '';
+    try {
+      if (!/^https?:\/\//i.test(value)) value = new URL(value, location.href).href;
+    } catch (e) {
+      return '';
+    }
+    if (!/^https?:\/\//i.test(value)) return '';
+    value = unwrapSourceUrl(value);
+    // Gemini のハイライト用フラグメントは同一 URL の重複脚注になるので落とす
+    value = value.replace(/#:~:.*$/, "");
+    return value.replace(/"/g, '%22');
+  }
+
+  function unwrapSourceUrl(url) {
+    try {
+      var u = new URL(url);
+      if (/google\./i.test(u.hostname) && (u.pathname === '/url' || u.pathname.indexOf('/url') === 0)) {
+        var q = u.searchParams.get('q') || u.searchParams.get('url') || u.searchParams.get('rurl');
+        if (q && /^https?:\/\//i.test(q)) return q;
+      }
+    } catch (e) {}
+    return url;
+  }
+
+  function resolveHrefFromNode(node) {
+    if (!node || !node.getAttribute) return '';
+    var attrs = [
+      'href', 'data-href', 'data-url', 'data-source-url', 'data-external-url', 'data-absolute-url',
+      'data-resource-url', 'data-redirect-url', 'cite', 'ng-href',
+    ];
+    for (var i = 0; i < attrs.length; i++) {
+      var resolved = resolveHref(node.getAttribute(attrs[i]));
+      if (resolved) return resolved;
+    }
+    return '';
+  }
+
+  function firstHttpUrl(text) {
+    var match = /https?:\/\/[^\s<>"']+/i.exec(String(text || ''));
+    if (!match) return '';
+    return resolveHref(match[0].replace(/[.,;:!?)]+$/g, ''));
+  }
+
+  function urlsInAttributes(node) {
+    var urls = [];
+    function take(el) {
+      if (!el || !el.attributes) return;
+      for (var i = 0; i < el.attributes.length; i++) {
+        var attrName = String(el.attributes[i].name || '');
+        if (/^(src|srcset|poster|style)$/i.test(attrName)) continue;
+        var value = String(el.attributes[i].value || '');
+        if (value.indexOf('http') < 0) continue;
+        (value.match(/https?:\/\/[^\s"'<>\\]+/gi) || []).forEach(function (raw) {
+          var href = resolveHref(raw.replace(/[.,;:!?)]+$/g, ''));
+          if (href && !isNoiseSourceUrl(href) && urls.indexOf(href) < 0) urls.push(href);
+        });
+      }
+    }
+    take(node);
+    queryAllDeep(node, '*').slice(0, 40).forEach(take);
+    return urls;
+  }
+
+  var citationPopoverLinks = new Map();
+  var citationPopoverTried = new Set();
+  var citationPopoverByNode = new WeakMap();
+  var citationPopoverOpened = new WeakSet();
+
+  function popoverControlId(node) {
+    if (!node || node.nodeType !== 1) return '';
+    if (node.getAttribute && node.getAttribute('aria-controls')) return String(node.getAttribute('aria-controls') || '');
+    var triggers = queryAllDeep(node, '[aria-controls]');
+    return triggers.length ? String(triggers[0].getAttribute('aria-controls') || '') : '';
+  }
+
+  function cachedPopoverLinks(node) {
+    var el = node;
+    while (el && el.nodeType === 1) {
+      if (citationPopoverByNode.has(el)) return citationPopoverByNode.get(el);
+      el = el.parentElement;
+    }
+    var id = popoverControlId(node);
+    if (id && citationPopoverLinks.has(id)) return citationPopoverLinks.get(id);
+    var name = normalizeCiteChipTitle(String((node && (node.innerText || node.textContent)) || '')).toLowerCase();
+    if (name && citationPopoverLinks.has('name:' + name)) return citationPopoverLinks.get('name:' + name);
+    return [];
+  }
+
+  /** hostname + pathname。クエリだけ違う同一ページは1件にまとめる。 */
+  function sourcePathKey(href) {
+    try {
+      var u = new URL(href, location.href);
+      var path = (u.pathname || '/').replace(/\/+$/, '') || '/';
+      return u.hostname.replace(/^www\./i, '').toLowerCase() + '\n' + path.toLowerCase();
+    } catch (e) {
+      return String(href || '');
+    }
+  }
+
+  function samePathSet(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    var keys = a.map(function (item) { return sourcePathKey(item.href); }).sort();
+    var other = b.map(function (item) { return sourcePathKey(item.href); }).sort();
+    for (var i = 0; i < keys.length; i++) if (keys[i] !== other[i]) return false;
+    return true;
+  }
+
+  /**
+   * 同じポップアップに「ドメインだけ」と「ドメイン＋パス」が並ぶときは、
+   * パス付きの方を残す。パスが違う URL は両方残す。
+   */
+  function pruneCoveredRootLinks(links) {
+    var deepHosts = {};
+    links.forEach(function (item) {
+      try {
+        var u = new URL(item.href, location.href);
+        var path = (u.pathname || '/').replace(/\/+$/, '') || '/';
+        if (path !== '/') deepHosts[u.hostname.replace(/^www\./i, '').toLowerCase()] = true;
+      } catch (e) {}
+    });
+    return links.filter(function (item) {
+      try {
+        var u = new URL(item.href, location.href);
+        var path = (u.pathname || '/').replace(/\/+$/, '') || '/';
+        var host = u.hostname.replace(/^www\./i, '').toLowerCase();
+        if (path === '/' && deepHosts[host]) return false;
+      } catch (e) {}
+      return true;
+    });
+  }
+
+  /**
+   * ポップアップは長い URL を「https://github.com/org/doc...」と省略表示する。
+   * 同じ一覧の別 URL の真の接頭辞になっている URL は、その省略形なので捨てる。
+   */
+  function pruneTruncatedLinks(links) {
+    return links.filter(function (item) {
+      var href = String(item.href || '');
+      if (!href || /\/$/.test(href)) return true;
+      return !links.some(function (other) {
+        var full = String(other.href || '');
+        return full !== href && full.length > href.length && full.indexOf(href) === 0;
+      });
+    });
+  }
+
+  function normalizePopoverLinks(links) {
+    return pruneTruncatedLinks(pruneCoveredRootLinks(links || []));
+  }
+
+  function rememberPopoverLinks(id, name, links, node) {
+    if (!links || !links.length) return;
+    var kept = normalizePopoverLinks(links);
+    if (!kept.length) return;
+    if (node && node.nodeType === 1) citationPopoverByNode.set(node, kept);
+    if (id) citationPopoverLinks.set(id, kept);
+    if (!name) return;
+    var key = 'name:' + name.toLowerCase();
+    var prev = citationPopoverLinks.get(key);
+    if (!prev) citationPopoverLinks.set(key, kept);
+    else if (!samePathSet(prev, kept)) citationPopoverLinks.delete(key);
+  }
+
+  function popoverLinkTitle(el, href) {
+    var host = '';
+    try { host = new URL(href).hostname.replace(/^www\./i, '').toLowerCase(); } catch (e) {}
+    var leaves = [];
+    function take(text) {
+      String(text || '').split(/\n+/).forEach(function (line) {
+        var value = line.replace(/\s+/g, ' ').trim();
+        if (value.length < 2 || value.length > 160) return;
+        if (/^https?:\/\//i.test(value)) return;
+        var lower = value.toLowerCase();
+        if (host && (lower === host || lower === 'www.' + host)) return;
+        if (leaves.indexOf(value) < 0) leaves.push(value);
+      });
+    }
+    take(el && el.getAttribute ? (el.getAttribute('aria-label') || el.getAttribute('title') || '') : '');
+    if (el && el.querySelectorAll) {
+      el.querySelectorAll('h1,h2,h3,h4,p,span,div,a').forEach(function (child) {
+        if (child.children && child.children.length) return;
+        take(child.innerText || child.textContent || '');
+      });
+    }
+    take(el && (el.innerText || el.textContent) || '');
+    if (!leaves.length) return '';
+    leaves.sort(function (a, b) { return b.length - a.length; });
+    return leaves[0];
+  }
+
+  function linksFromPopoverPanel(panel) {
+    var out = [];
+    var seen = {};
+    // title は本当の題名だけ。URL で埋めるとチップ文字列（fallback）が使われなくなる。
+    function add(href, title) {
+      if (!href || isNoiseSourceUrl(href) || isPaidAdUrl(href)) return;
+      var key = sourcePathKey(href);
+      if (seen[key]) return;
+      seen[key] = true;
+      var label = String(title || '').trim();
+      if (/^https?:\/\//i.test(label)) label = '';
+      out.push({ href: href, title: label });
+    }
+    queryAllDeep(panel, 'a[href], [href], [data-href], [data-url], [data-source-url], [data-external-url], [data-absolute-url]').forEach(function (el) {
+      var href = resolveHrefFromNode(el);
+      if (!href) return;
+      add(href, popoverLinkTitle(el, href));
+    });
+    // 属性・本文テキストから拾った URL に、別リンクの題名を付けない（チップ文字列を fallback にする）
+    urlsInAttributes(panel).forEach(function (href) { add(href, ''); });
+    var text = String(panel.innerText || panel.textContent || '');
+    // 表示用に「…」「...」で切られた URL は実在しないので拾わない
+    var urlPattern = /https?:\/\/[^\s<>"']+/gi;
+    var match;
+    while ((match = urlPattern.exec(text))) {
+      var raw = match[0];
+      if (/(\.\.\.|…)$/.test(raw)) continue;
+      var after = text.slice(match.index + raw.length, match.index + raw.length + 3);
+      if (/^(\.\.\.|…)/.test(after)) continue;
+      var href = resolveHref(raw.replace(/[.,;:!?)]+$/g, ''));
+      add(href, '');
+    }
+    return normalizePopoverLinks(out).slice(0, 8);
+  }
+
+  function findPopoverPanel(id) {
+    if (!id) return null;
+    var panel = document.getElementById(id);
+    if (panel) return panel;
+    var found = null;
+    queryAllDeep(document, '[id]').some(function (el) {
+      if (el.id === id) { found = el; return true; }
+      return false;
+    });
+    return found;
+  }
+
+  function visiblePopoverSet() {
+    var set = new Set();
+    var vh = window.innerHeight || 0;
+    queryAllDeep(document, '[role="dialog"], [role="tooltip"], [data-radix-popper-content-wrapper], [data-state="open"]').forEach(function (el) {
+      if (!el || !el.getBoundingClientRect) return;
+      var rect = el.getBoundingClientRect();
+      if (rect.width > 8 && rect.height > 8 && rect.bottom > 0 && rect.top < vh) set.add(el);
+    });
+    return set;
+  }
+
+  /** 閉じた出典バッジは DOM に URL が無い。保存中だけ開いて、パス付き URL を控える。 */
+  async function warmCitationPopovers() {
+    try {
+    var triggers = [];
+    var seen = new Set();
+    function push(el) {
+      if (!el || el.nodeType !== 1) return;
+      var trigger = el.closest
+        ? (el.closest('button, [role="button"], [aria-haspopup], [aria-controls], [data-testid*="citation"], [data-testid*="footnote"]') || el)
+        : el;
+      if (!trigger || seen.has(trigger) || citationPopoverOpened.has(trigger)) return;
+      if (trigger.closest && trigger.closest('nav, form, [data-message-actions], [data-testid*="sidebar"]')) return;
+      var text = String(trigger.innerText || trigger.textContent || '').replace(/\s+/g, ' ').trim();
+      if (isAdUiTrigger(trigger, text)) return;
+      if (text.length > 80 && !(trigger.getAttribute && trigger.getAttribute('aria-controls')) && !isCitationPill(trigger)) return;
+      seen.add(trigger);
+      triggers.push(trigger);
+    }
+    queryAllDeep(document, '[data-d-component="popover-trigger"], [aria-haspopup], [aria-controls], [data-testid*="citation"], [data-testid*="footnote"], source-inline-chip').forEach(push);
+    queryAllDeep(document, 'span, a, button, div').forEach(function (el) {
+      if (isCitationPill(el) || looksLikeCiteChipText(el)) push(el);
+    });
+    var opened = 0;
+    for (var i = 0; i < triggers.length && opened < 40; i++) {
+      var trigger = triggers[i];
+      if (!trigger.isConnected) continue;
+      if (trigger.tagName === 'A' && resolveHrefFromNode(trigger) && !isCitationPill(trigger)) continue;
+      var rect = trigger.getBoundingClientRect ? trigger.getBoundingClientRect() : null;
+      var vh = window.innerHeight || 0;
+      if (!rect || rect.width < 4 || rect.height < 4 || rect.bottom < 0 || rect.top > vh) continue;
+      var id = String((trigger.getAttribute && trigger.getAttribute('aria-controls')) || '');
+      var name = normalizeCiteChipTitle(String(trigger.innerText || trigger.textContent || '').replace(/\s+/g, ' ').trim());
+      citationPopoverOpened.add(trigger);
+      if (id) citationPopoverTried.add(id);
+      var panel = id ? findPopoverPanel(id) : null;
+      var links = panel ? linksFromPopoverPanel(panel) : [];
+      if (!links.length) {
+        opened += 1;
+        var before = visiblePopoverSet();
+        try { trigger.click(); } catch (e) {}
+        for (var wait = 0; wait < 8 && !links.length; wait++) {
+          await delay(70);
+          if (id) {
+            panel = findPopoverPanel(id);
+            if (panel) links = linksFromPopoverPanel(panel);
+          }
+          if (!links.length) {
+            visiblePopoverSet().forEach(function (candidate) {
+              if (links.length || before.has(candidate)) return;
+              links = linksFromPopoverPanel(candidate);
+            });
+          }
+        }
+        try {
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+        } catch (e2) {}
+        await delay(40);
+        if (trigger.getAttribute && trigger.getAttribute('aria-expanded') === 'true') {
+          try { trigger.click(); } catch (e3) {}
+          await delay(40);
+        }
+      }
+      rememberPopoverLinks(id, name, links, trigger);
+    }
+    dismissObstructions();
+    } catch (e) {}
+  }
+
+  /** 広告・スポンサーの説明ポップアップ。出典バッジとは別に、画像のスクリーンショットに被さる。 */
+  function isAdUiTrigger(el, text) {
+    var value = String(text || '').replace(/\s+/g, ' ').trim();
+    if (isAdChromeText(value) || isAdDetailHeadingText(value)) return true;
+    if (/スポンサー|この広告|sponsored\b|about this ad/i.test(value) && value.length < 80) return true;
+    var label = '';
+    if (el && el.getAttribute) label = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('data-testid') || '');
+    if (/広告|sponsor/i.test(label) && !/citation|出典|footnote|引用/i.test(label)) return true;
+    return false;
+  }
+
+  /** 撮影前に、画像へ被さっている広告・出典ポップアップを閉じる。 */
+  function dismissObstructions() {
+    try {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true }));
+    } catch (e) {}
+    var vh = window.innerHeight || 0;
+    var vw = window.innerWidth || 0;
+    queryAllDeep(document, '[role="dialog"], [role="tooltip"], [role="alertdialog"], [data-radix-popper-content-wrapper]').forEach(function (el) {
+      if (!el || !el.isConnected || el === document.body) return;
+      if (el.querySelector && el.querySelector('[data-message-author-role], [data-message-id]')) return;
+      var rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+      if (rect && vw && vh && rect.width > vw * 0.9 && rect.height > vh * 0.9) return;
+      var text = '';
+      try { text = String(el.innerText || '').replace(/\s+/g, ' ').trim(); } catch (e2) {}
+      if (text.length > 1800) return;
+      var role = String(el.getAttribute('role') || '').toLowerCase();
+      var ad = /スポンサー|この広告|sponsored|about this ad|広告主と共有/i.test(text);
+      if (!ad && role !== 'dialog' && role !== 'tooltip' && role !== 'alertdialog' && !el.hasAttribute('data-radix-popper-content-wrapper')) return;
+      logOverlay('remove', el);
+      try { el.remove(); } catch (e3) {}
+    });
+  }
+
+  function logOverlay(kind, node, extra) {
+    if (!debugCitationsEnabled() || overlayLog.length >= 40 || !node) return;
+    var rect = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+    var text = '';
+    try { text = String(node.innerText || '').replace(/\s+/g, ' ').trim(); } catch (e) {}
+    var style = null;
+    try { style = getComputedStyle(node); } catch (e2) {}
+    var record = {
+      kind: kind,
+      tag: String(node.tagName || ''),
+      role: node.getAttribute ? (node.getAttribute('role') || '') : '',
+      testId: node.getAttribute ? (node.getAttribute('data-testid') || '') : '',
+      className: clipDebug(classNameOf(node), 120),
+      position: style ? style.position : '',
+      zIndex: style ? style.zIndex : '',
+      rect: rect ? { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) } : null,
+      text: clipDebug(text, 160),
+    };
+    if (extra) Object.keys(extra).forEach(function (key) { record[key] = extra[key]; });
+    overlayLog.push(record);
+  }
+
+  /** el の手前に重なっている要素（elementsFromPoint で el / el の祖先に当たるまでの全て）。 */
+  function overlayBlockers(el) {
+    if (!el || !el.getBoundingClientRect) return [];
+    var rect = el.getBoundingClientRect();
+    var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    var left = Math.max(rect.left, 0);
+    var top = Math.max(rect.top, 0);
+    var right = Math.min(rect.right, vw);
+    var bottom = Math.min(rect.bottom, vh);
+    if (right - left < 8 || bottom - top < 8) return [];
+    var found = [];
+    [[0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]].forEach(function (p) {
+      var stack = [];
+      try { stack = document.elementsFromPoint(left + (right - left) * p[0], top + (bottom - top) * p[1]) || []; } catch (e) {}
+      for (var i = 0; i < stack.length; i++) {
+        var node = stack[i];
+        if (!node || node === el) break;
+        if (el.contains && el.contains(node)) break;
+        if (node.contains && node.contains(el)) break;
+        if (node === document.documentElement || node === document.body) break;
+        if (found.indexOf(node) < 0) found.push(node);
+      }
+    });
+    return found;
+  }
+
+  /** blocker を含む「el を含まない最上位の枝」。メッセージ本文を巻き込む場合は blocker 自身だけ。 */
+  function overlayBranch(node, el) {
+    var target = node;
+    while (target.parentElement && target.parentElement !== document.body && target.parentElement !== document.documentElement) {
+      var parent = target.parentElement;
+      if (parent.contains(el)) break;
+      target = parent;
+    }
+    if (target !== node && target.querySelector && target.querySelector('[data-message-author-role], [data-message-id], main')) return node;
+    return target;
+  }
+
+  function restoreHidden() {
+    hiddenForCapture.splice(0).forEach(function (item) {
+      try {
+        if (item.value) item.el.style.setProperty('visibility', item.value, item.priority);
+        else item.el.style.removeProperty('visibility');
+      } catch (e) {}
+    });
+  }
+
+  /** 広告・サイドメニュー・ツールチップなど el に被さるものを撮影の間だけ visibility:hidden にする。 */
+  function clearOverlaysFor(el) {
+    var blockers = overlayBlockers(el);
+    var hidden = 0;
+    blockers.forEach(function (node) {
+      var target = overlayBranch(node, el);
+      if (!target || !target.style) return;
+      for (var i = 0; i < hiddenForCapture.length; i++) if (hiddenForCapture[i].el === target) return;
+      logOverlay('hide', target, { blocker: String(node.tagName || '') });
+      hiddenForCapture.push({
+        el: target,
+        value: target.style.getPropertyValue('visibility'),
+        priority: target.style.getPropertyPriority('visibility'),
+      });
+      try { target.style.setProperty('visibility', 'hidden', 'important'); hidden += 1; } catch (e) {}
+    });
+    return hidden;
+  }
+
+  function coveredByOverlay(el) {
+    return overlayBlockers(el).length > 0;
+  }
+
+  window.__ctRestoreCapture = function () {
+    restoreHidden();
+    return true;
+  };
+
+  function formatPopoverLinks(links, fallbackTitle) {
+    return links.filter(function (item) { return !isPaidAdUrl(item.href); }).map(function (item) {
+      var title = String(item.title || '').trim();
+      if (/^https?:\/\//i.test(title)) title = '';
+      var label = title || fallbackTitle || item.href;
+      return '<a href="' + esc(item.href) + '">' + esc(label) + '</a>';
+    }).join('');
+  }
+
+  /**
+   * 文中の語そのものがポップアップのトリガーになっているチップ（見出しの docker-mailserver など）。
+   * favicon 付きバッジや「Name+1」「example.com」の短縮表示ではなく、本文の一部なので名前を残す。
+   */
+  function inlineChipText(node, chipText) {
+    if (!node || node.nodeType !== 1) return '';
+    if (node.closest && node.closest('[data-d-component="badge"]')) return '';
+    var text = String(chipText || '').replace(/\s+/g, ' ').trim();
+    var badges = node.querySelectorAll ? node.querySelectorAll('[data-d-component="badge"]') : [];
+    if (badges.length) {
+      // バッジ（favicon + サイト名）以外に本文の語があるときだけ、その語を残す
+      var outside = String(node.innerText || node.textContent || '');
+      badges.forEach(function (badge) {
+        var badgeText = String(badge.innerText || badge.textContent || '');
+        if (badgeText) outside = outside.split(badgeText).join(' ');
+      });
+      text = normalizeCiteChipTitle(outside);
+    } else if (node.querySelector && node.querySelector('img, svg')) {
+      return '';
+    }
+    if (!text || text.length > 80) return '';
+    if (/^[\d+＋・.]+$/.test(text)) return '';
+    if (looksLikeCiteChipTextValue(text)) return '';
+    return text;
+  }
+
+  function isInlineTextChip(node, chipText) {
+    return Boolean(inlineChipText(node, chipText));
+  }
+
+  /** popover から取れた URL をチップの HTML にする。inline の語は本文に残し、脚注はその直後に付ける。 */
+  function citationChipHtml(node, links, chipText) {
+    var inline = inlineChipText(node, chipText);
+    var anchors = formatPopoverLinks(links, inline || chipText);
+    if (!anchors) return { html: '', inline: false };
+    if (inline) return { html: esc(inline) + anchors, inline: true };
+    return { html: anchors, inline: false };
+  }
+
+  /** ChatGPT の出典バッジは URL を閉じた popover（aria-controls）側に持つ */
+  function popoverHref(node) {
+    var cached = cachedPopoverLinks(node);
+    if (cached.length) return cached[0].href;
+    if (!node || node.nodeType !== 1) return '';
+    var id = popoverControlId(node);
+    if (!id) return '';
+    var panel = findPopoverPanel(id);
+    if (!panel || panel === node) return '';
+    var links = linksFromPopoverPanel(panel);
+    if (links.length) return links[0].href;
+    return findHrefDeep(panel, 1);
+  }
+
+  function findHrefDeep(node, depth) {
+    if (!node) return '';
+    var href = resolveHrefFromNode(node);
+    if (href && !isNoiseSourceUrl(href)) return href;
+    if (node.closest) {
+      var parent = node.closest('a');
+      if (parent) {
+        href = resolveHrefFromNode(parent);
+        if (href && !isNoiseSourceUrl(href)) return href;
+      }
+    }
+    var found = '';
+    queryAllDeep(node, 'a[href], [data-href], [data-url], [data-source-url], [data-external-url], [data-absolute-url]').some(function (el) {
+      found = resolveHrefFromNode(el);
+      return Boolean(found && !isNoiseSourceUrl(found));
+    });
+    if (found && !isNoiseSourceUrl(found)) return found;
+    var fromAttrs = urlsInAttributes(node);
+    if (fromAttrs.length) return fromAttrs[0];
+    if (!depth) {
+      var fromPopover = popoverHref(node);
+      if (fromPopover) return fromPopover;
+    }
+    var blob = [
+      node.getAttribute && node.getAttribute('aria-label'),
+      node.getAttribute && node.getAttribute('title'),
+      node.innerText,
+      node.textContent,
+    ].join(' ');
+    var fromText = firstHttpUrl(blob);
+    return fromText && !isNoiseSourceUrl(fromText) ? fromText : '';
+  }
+
+  /** ドメイン風に見えるが実体はファイル名（cl.exe など）の拡張子 */
+  var FAKE_DOMAIN_EXTS =
+    /^(exe|dll|bat|cmd|com|msi|sys|bin|so|dylib|app|jar|py|js|mjs|cjs|ts|tsx|jsx|c|cc|cpp|cxx|h|hpp|rs|go|java|kt|swift|rb|php|pl|sh|bash|zsh|ps1|md|txt|json|ya?ml|toml|xml|html?|css|scss|less|pdf|png|jpe?g|gif|svg|webp|ico|zip|tar|gz|tgz|7z|rar|log|bak|tmp|obj|o|lib|a|wasm|map|lock|ini|cfg|conf|csv|tsv|sql|db|doc|docx|xls|xlsx|ppt|pptx)$/i;
+
+  function isCodeLikeNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || '').toUpperCase();
+    if (tag === 'CODE' || tag === 'PRE' || tag === 'SAMP' || tag === 'KBD') return true;
+    var el = node.parentElement;
+    while (el) {
+      var p = String(el.tagName || '').toUpperCase();
+      if (p === 'CODE' || p === 'PRE' || p === 'SAMP' || p === 'KBD') return true;
+      el = el.parentElement;
+    }
+    return false;
+  }
+
+  // --- Citations / sources: pills, jslog, payloads, noise filtering ---
+
+  function isCitationPill(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || '').toUpperCase();
+    if (tag === 'SOURCE-INLINE-CHIP' || tag === 'CITATION-CHIP' || tag === 'FOOTNOTE-CHIP') return true;
+    if (node.getAttribute) {
+      if (node.hasAttribute('data-assistant-sources-trigger') || node.hasAttribute('data-assistant-sources-payload')) return true;
+      if (node.hasAttribute('data-assistant-grouped-webpages') || node.hasAttribute('data-assistant-grouped-webpages-item')) return true;
+      if (node.getAttribute('data-content-reference-type') === 'grouped_webpages') return true;
+    }
+    var testId = String(node.getAttribute && node.getAttribute('data-testid') || '').toLowerCase();
+    if (testId.indexOf('citation') >= 0 || testId.indexOf('source-pill') >= 0 || testId.indexOf('footnote') >= 0) return true;
+    var cls = classNameOf(node).toLowerCase();
+    if (/webpage-citation|citation-pill|source-pill|source-inline-chip(?!-container)|cite-pill|reference-pill|group\/footnote|\/footnote/.test(cls)) return true;
+    var aria = String(node.getAttribute && node.getAttribute('aria-label') || '').toLowerCase();
+    if (/citation from|引用元|出典の詳細|ソースの詳細|view source|からの引用|出典を表示|view citation|情報源/.test(aria)) return true;
+    // CODE/PRE 内の cl.exe 等を引用 pill と誤認しない
+    if (isCodeLikeNode(node)) return false;
+    // ChatGPT の短縮表示（例: WWebull+1 / US EPA +1）— BUTTON 以外の span にも付く
+    if (looksLikeCiteChipText(node)) return true;
+    return false;
+  }
+
+  function looksLikeCiteChipText(node) {
+    if (isCodeLikeNode(node)) return false;
+    return looksLikeCiteChipTextValue(String(node.innerText || node.textContent || ''));
+  }
+
+  /** 「example.com」「WWebull+1」など ChatGPT の短縮表示チップの文字列か */
+  function looksLikeCiteChipTextValue(raw) {
+    var text = String(raw || '')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text || text.length > 48) return false;
+    if (/^(https?:\/\/|www\.)/i.test(text)) return false;
+    if (/[=\/\\]/.test(text)) return false;
+    // 例: example.com / example.com+1 — ただし cl.exe / note.md は除外
+    var domainLike = /^([A-Za-z0-9][A-Za-z0-9._-]{0,30})\.([A-Za-z]{2,})(?:\s*[+＋]\d+)?$/.exec(text);
+    if (domainLike) return !FAKE_DOMAIN_EXTS.test(domainLike[2]);
+    // 例: WWebull+1 / US EPA +1 / 楽天市場+2
+    if (/^[A-Za-z][A-Za-z0-9._-]{1,30}\s*[+＋]\d+$/.test(text)) return true;
+    if (/^[A-Za-z][A-Za-z0-9 ._-]{1,30}\s*[+＋]\d+$/.test(text)) return true;
+    if (/^[\u3040-\u30ff\u4e00-\u9fff\w][\u3040-\u30ff\u4e00-\u9fff\w ._-]{0,30}\s*[+＋]\d+$/.test(text)) return true;
+    return false;
+  }
+
+  // 検索結果カルーセル等は本文に混ぜると壊れる。参照一覧側で拾う。
+  function isSourcesChrome(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || '').toUpperCase();
+    if (
+      tag === 'SOURCES-CAROUSEL-INLINE' ||
+      tag === 'SOURCES-CAROUSEL' ||
+      tag === 'STRUCTURED-SOURCES-BLOCK' ||
+      tag === 'SOURCES-SIDEBAR' ||
+      tag === 'SIDEBAR-SOURCES' ||
+      tag === 'MODEL-THOUGHTS' ||
+      tag === 'THOUGHTS-ANIMATION'
+    ) return true;
+    var cls = classNameOf(node).toLowerCase();
+    return /\b(model-thoughts|thoughts-container|sources-carousel|structured-sources|sources-sidebar)\b/.test(cls);
+  }
+
+  function extractCiteName(aria) {
+    var text = String(aria || '').replace(/\s+/g, ' ').trim();
+    if (!text) return '';
+    // ChatGPT: 「国会会議録検索システム, 2件の情報源」
+    var chatgptGrouped = /^(.+?)\s*[,，]\s*\d+\s*件の情報源/.exec(text);
+    if (chatgptGrouped) return String(chatgptGrouped[1] || '').trim();
+    var match =
+      /^(.+?)\s*からの引用/.exec(text) ||
+      /citation from\s+(.+?)(?:\.|$)/i.exec(text) ||
+      /(?:引用元|出典|ソース)[：:\s]+(.+?)(?:\.|。|$)/.exec(text) ||
+      /from\s+([^.]{1,200})\./i.exec(text);
+    return match ? String(match[1] || '').trim() : '';
+  }
+
+  function stripTrackingParams(url) {
+    try {
+      var u = new URL(url);
+      ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'].forEach(function (key) {
+        u.searchParams.delete(key);
+      });
+      return u.href;
+    } catch (e) {
+      return url;
+    }
+  }
+
+  /** ChatGPT の data-assistant-sources-payload JSON から URL 一覧を取り出す */
+  function parseAssistantSourcesPayload(node) {
+    var items = [];
+    if (!node) return items;
+    var seen = {};
+    function takeAttr(el) {
+      if (!el || !el.getAttribute) return;
+      var raw = el.getAttribute('data-assistant-sources-payload');
+      if (!raw) return;
+      try {
+        var parsed = JSON.parse(raw.replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+        if (!Array.isArray(parsed)) return;
+        parsed.forEach(function (entry) {
+          if (!entry || typeof entry !== 'object') return;
+          var rawUrl = String(entry.url || '');
+          if (isPaidAdUrl(rawUrl)) return;
+          var href = resolveHref(stripTrackingParams(rawUrl));
+          if (!href || isNoiseSourceUrl(href) || seen[href]) return;
+          seen[href] = true;
+          var title =
+            String(entry.attribution || entry.title || '').replace(/\s+/g, ' ').trim() || href;
+          items.push({ url: href, title: title });
+        });
+      } catch (e) {}
+    }
+    takeAttr(node);
+    if (node.querySelectorAll) {
+      node.querySelectorAll('[data-assistant-sources-payload]').forEach(takeAttr);
+    }
+    queryAllDeep(node, '[data-assistant-sources-payload]').forEach(takeAttr);
+    return items;
+  }
+
+  function assistantSourceUrls(node) {
+    return parseAssistantSourcesPayload(node).map(function (item) { return item.url; });
+  }
+
+  function isNoiseSourceUrl(url) {
+    if (isPaidAdUrl(url)) return true;
+    try {
+      var u = new URL(url);
+      var host = u.hostname.replace(/^www\./i, '').toLowerCase();
+      var path = u.pathname || '/';
+      var here = location.href.split('#')[0];
+      if (u.href.split('#')[0] === here) return true;
+      if (host === 'chatgpt.com' || host.endsWith('.chatgpt.com')) {
+        // 会話本体以外のサイトクロム（ナビ・ログイン・ヘルプ）は参照にしない
+        if (/^\/?$/.test(path) || /^\/(c|uc)\//.test(path)) return true;
+        if (/^\/(auth|images|plugins|api|backend-api|public-api|share|search|g|codex|workspace|settings|account|payments?|checkout|anon|invite)\b/i.test(path)) return true;
+        return true;
+      }
+      if (host === 'openai.com' || host.endsWith('.openai.com')) {
+        if (/^\/(terms|privacy|policies|cookie|chatgpt\/pricing|product|blog|news|index|about|careers|security|compliance|research|customer-stories|form|login|signin)\b/i.test(path)) return true;
+        if (/help\.openai\.com$/i.test(u.hostname)) return true;
+      }
+      if (/help\.openai\.com$/i.test(host)) return true;
+      if (/gemini\.google\.com$/i.test(host)) {
+        if (/^\/(u\/\d+\/)?app\/?/.test(path)) return true;
+        if (path === '/' || path === '' || /^\/images\/?$/i.test(path)) return true;
+      }
+      if (/google\./i.test(host) && /^\/search\b/.test(path)) return true;
+      if (/gstatic\.com$/i.test(host)) return true;
+      if (/accounts\.google\.com$/i.test(host)) return true;
+      if (/microsoftonline\.com$|live\.com$|apple\.com$/i.test(host) && /\/(oauth|authorize|login|signin)/i.test(path + u.search)) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  /** ChatGPT のホームページカード（1行リンク）— 脚注化せず本文リンクとして残す */
+  function isUrlCardReference(node) {
+    var el = node;
+    while (el && el.getAttribute) {
+      var type = String(el.getAttribute('data-content-reference-type') || '');
+      if (type === 'url') return true;
+      if (type === 'grouped_webpages') return false;
+      if (el.hasAttribute('data-assistant-url-reference')) return true;
+      el = el.parentElement;
+    }
+    return false;
+  }
+
+  function keepLinkHtml(href, text) {
+    return '<p><a data-ct-keep-link="1" href="' + esc(href) + '">' + esc(text) + '</a></p>';
+  }
+
+  function linkFromCitation(node) {
+    var aria = '';
+    if (node.getAttribute) aria = node.getAttribute('aria-label') || '';
+    if (!aria && node.querySelector) {
+      var labeled = node.querySelector('[aria-label]');
+      if (labeled) aria = labeled.getAttribute('aria-label') || '';
+    }
+    var citeName = extractCiteName(aria);
+    var rawTitle = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    var chipTitle = normalizeCiteChipTitle(rawTitle);
+    var title = citeName || chipTitle;
+    if (!citeName && (!title || title.length <= 2 || /^[\d+＋・.]+$/.test(title))) title = '';
+    var payloadSources = parseAssistantSourcesPayload(node);
+    var href = findHrefDeep(node);
+    var noiseFiltered = [];
+    var rawHref = resolveHrefFromNode(node);
+    if (rawHref && isNoiseSourceUrl(rawHref)) noiseFiltered.push(rawHref);
+    var keepCard = isUrlCardReference(node);
+    var extra = {
+      resolvedHref: href || (payloadSources[0] && payloadSources[0].url) || '',
+      jslogUrls: [],
+      noiseFiltered: noiseFiltered,
+      payloadCount: payloadSources.length,
+      urlCard: keepCard,
+    };
+    var popLinks = cachedPopoverLinks(node);
+    if (popLinks.length) {
+      var chip = citationChipHtml(node, popLinks, title || citeName || chipTitle);
+      if (chip.html) {
+        recordCitationDebug(node, chip.html, chip.inline ? 'popover-inline' : 'popover', extra);
+        return chip.html;
+      }
+    }
+    if (href && isPaidAdUrl(href)) {
+      recordCitationDebug(node, '', 'ad', extra);
+      return '';
+    }
+    payloadSources = payloadSources.filter(function (item) { return !isPaidAdUrl(item.url); });
+    if (payloadSources.length) {
+      var fromPayload = payloadSources.map(function (item) {
+        var label = item.title || title || citeName || item.url;
+        return keepCard
+          ? keepLinkHtml(item.url, label)
+          : '<a href="' + esc(item.url) + '">' + esc(label) + '</a>';
+      }).join('');
+      recordCitationDebug(node, fromPayload, keepCard ? 'url-card' : (payloadSources.length > 1 ? 'payload-multi' : 'payload'), extra);
+      return fromPayload;
+    }
+    if (href) {
+      var anchor = keepCard
+        ? keepLinkHtml(href, title || citeName || href)
+        : '<a href="' + esc(href) + '">' + esc(title || citeName || href) + '</a>';
+      recordCitationDebug(node, anchor, keepCard ? 'url-card' : 'anchor', extra);
+      return anchor;
+    }
+    var textUrl = firstHttpUrl(title + ' ' + aria + ' ' + (node.innerText || ''));
+    if (textUrl) {
+      var textAnchor = keepCard
+        ? keepLinkHtml(textUrl, title || textUrl)
+        : '<a href="' + esc(textUrl) + '">' + esc(title || textUrl) + '</a>';
+      recordCitationDebug(node, textAnchor, keepCard ? 'url-card' : 'anchor', extra);
+      return textAnchor;
+    }
+    // URL が無いチップは内側の通常リンクを捨てない
+    var inner = '';
+    if (node.shadowRoot) inner += sanitize(node.shadowRoot);
+    node.childNodes.forEach(function (child) { inner += sanitize(child); });
+    if (/<a\s/i.test(inner)) {
+      recordCitationDebug(node, inner, 'inner-anchor', extra);
+      return inner;
+    }
+    if (citeName || title) {
+      var named = '<span data-ct-cite-name="' + esc(citeName || title) + '"></span>';
+      recordCitationDebug(node, named, 'cite-name', extra);
+      return named;
+    }
+    recordCitationDebug(node, inner, 'empty', extra);
+    return inner;
+  }
+
+  function normalizeCiteChipTitle(text) {
+    var value = String(text || '')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s*[+＋]\d+\s*$/g, '')
+      .replace(/\s*,\s*\d+\s*件の情報源\s*$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    // ChatGPT が favicon 文字を重ねる例: WWebull → Webull / 国 国会… → 国会…
+    if (/^([A-Za-z])\1[A-Za-z]/.test(value)) value = value.slice(1);
+    var faviconCjk = /^([\u3040-\u30ff\u4e00-\u9fff])\s+\1/.exec(value);
+    if (faviconCjk) value = value.replace(/^[\u3040-\u30ff\u4e00-\u9fff]\s+/, '');
+    return value;
+  }
+
+  /** sanitize 後に残った「Name+1」プレーンテキストを脚注マーカーへ */
+  function replaceBareCiteChipsInHtml(html) {
+    if (!html) return html;
+    var parts = String(html).split(/(<[^>]+>)/g);
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i] || parts[i].charAt(0) === '<') continue;
+      // 「+3.8%」「+1,200」のような数値は出典チップではない
+      parts[i] = parts[i].replace(
+        /([A-Za-z\u3040-\u30ff\u4e00-\u9fff](?:[A-Za-z0-9._\u3040-\u30ff\u4e00-\u9fff -]|&amp;){0,40}?)\s*[+＋](\d+)(?![.,]\d|\s*[%％])(?=[^\w+]|$)/g,
+        function (all, name) {
+          var cleaned = normalizeCiteChipTitle(name);
+          if (!cleaned || cleaned.length < 2) return all;
+          if (debugCitationsEnabled() && debugCitationRecords.length < 20) {
+            debugCitationRecords.push({
+              tag: '#text',
+              className: '',
+              ariaLabel: '',
+              attrs: { hasJslog: false },
+              resolvedHref: '',
+              jslogUrls: [],
+              noiseFiltered: [],
+              output: '<span data-ct-cite-name="' + esc(cleaned) + '"></span>',
+              outcome: 'bare-text',
+            });
+          }
+          return '<span data-ct-cite-name="' + esc(cleaned) + '"></span>';
+        },
+      );
+    }
+    return parts.join('');
+  }
+
+  function extractLinksHtml(node) {
+    var html = '';
+    var seen = {};
+    function add(href, title) {
+      if (!href || seen[href] || isNoiseSourceUrl(href)) return;
+      seen[href] = true;
+      html += '<a href="' + esc(href) + '">' + esc(title || href) + '</a>';
+    }
+    queryAllDeep(node, 'a[href], [data-href], [data-url], [data-source-url], [data-external-url], [data-absolute-url], source-inline-chip, button[aria-label*="citation"]').forEach(function (el) {
+      var href = findHrefDeep(el);
+      var aria = String(el.getAttribute && el.getAttribute('aria-label') || '');
+      var title = extractCiteName(aria) || String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() || href;
+      add(href, title);
+    });
+    var textUrls = String(node.innerText || node.textContent || '').match(/https?:\/\/[^\s<>"']+/gi) || [];
+    textUrls.forEach(function (raw) {
+      add(resolveHref(raw.replace(/[.,;:!?)]+$/g, '')), raw);
+    });
+    return html;
+  }
+
+  function mergeMissingLinks(html, extraLinks) {
+    if (!extraLinks) return html;
+    var missing = '';
+    String(extraLinks).replace(/<a href="([^"]+)"[^>]*>[\s\S]*?<\/a>/g, function (tag, href) {
+      if (html.indexOf(href) < 0) missing += tag;
+      return tag;
+    });
+    return missing ? html + missing : html;
+  }
+
+  function addSource(map, title, url) {
+    var href = resolveHref(url);
+    if (!href || isNoiseSourceUrl(href)) return;
+    var label = String(title || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || href;
+    if (!map.has(href)) map.set(href, label);
+  }
+
+  function collectSourcesFromRoot(root, map) {
+    if (!root) return;
+    queryAllDeep(
+      root,
+      'a[href], [data-href], [data-url], [data-source-url], [data-absolute-url], [data-testid*="citation"], [data-assistant-sources-payload], [data-assistant-sources-trigger], source-inline-chip, sources-carousel-inline, button[aria-label*="citation"], button[aria-label*="引用"], button[aria-label*="出典"], button[aria-label*="情報源"]'
+    ).forEach(function (el) {
+      var href = findHrefDeep(el);
+      if (!href && el.closest) {
+        var parent = el.closest('a');
+        if (parent) href = findHrefDeep(parent);
+      }
+      var aria = String(el.getAttribute && el.getAttribute('aria-label') || '');
+      var title = extractCiteName(aria) || String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+      addSource(map, title, href);
+      parseAssistantSourcesPayload(el).forEach(function (item) {
+        addSource(map, item.title || title, item.url);
+      });
+    });
+  }
+
+  function collectSourcesFromHtml(html, map) {
+    String(html || '').replace(/<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, function (_all, href, inner) {
+      addSource(map, plainText(inner), href);
+      return _all;
+    });
+    var withoutTags = String(html || '').replace(/<[^>]+>/g, ' ');
+    var urls = withoutTags.match(/https?:\/\/[^\s<>"']+/gi) || [];
+    urls.forEach(function (raw) {
+      addSource(map, raw, raw.replace(/[.,;:!?)]+$/g, ''));
+    });
+  }
+
+  async function tryCollectFromSourcesFlyout(map) {
+    var buttons = queryAllDeep(document, 'button');
+    var target = null;
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      var cls = classNameOf(btn).toLowerCase();
+      var blob = ((btn.getAttribute('aria-label') || '') + ' ' + (btn.getAttribute('data-testid') || '') + ' ' + (btn.innerText || '') + ' ' + cls).toLowerCase();
+      // ナビやログインを誤クリックしないよう、出典パネル系に寄せる
+      if (
+        /legacy-sources-sidebar|sources-sidebar|sources-carousel|structured-sources|出典|引用元|参考文献/.test(blob) ||
+        (/^(sources|citations|ソース)\b/.test(blob.replace(/\s+/g, ' ').trim()) && !/login|サインイン|新規登録/.test(blob))
+      ) {
+        target = btn;
+        break;
+      }
+    }
+    if (!target) return;
+    try {
+      target.click();
+      await delay(450);
+      harvestOpenSourcePanels(map);
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      await delay(120);
+    } catch (e) {}
+  }
+
+  function harvestOpenSourcePanels(map) {
+    var flyouts = queryAllDeep(
+      document,
+      '[data-testid="screen-threadFlyOut"], [data-testid*="flyout"], [data-testid*="FlyOut"], [role="dialog"], [role="complementary"], [data-radix-popper-content-wrapper], [data-state="open"], sources-sidebar, sidebar-sources, .sources-sidebar, .legacy-sources-sidebar, structured-sources-block'
+    );
+    flyouts.forEach(function (flyout) { collectSourcesFromRoot(flyout, map); });
+    queryAllDeep(
+      document,
+      'sources-sidebar, sidebar-sources, .sources-sidebar, .legacy-sources-sidebar, structured-sources-block, sources-carousel, sources-carousel-inline'
+    ).forEach(function (el) {
+      collectSourcesFromRoot(el, map);
+    });
+  }
+
+  async function expandChatgptCitationPills(map) {
+    // クリック不要: payload 属性に URL が入っている
+    queryAllDeep(document, '[data-assistant-sources-payload], [data-assistant-sources-trigger]').forEach(function (el) {
+      parseAssistantSourcesPayload(el).forEach(function (item) {
+        addSource(map, item.title, item.url);
+      });
+    });
+    var pills = [];
+    var seen = new Set();
+    function addPill(el) {
+      if (!el || seen.has(el)) return;
+      seen.add(el);
+      pills.push(el);
+    }
+    queryAllDeep(
+      document,
+      '[data-testid="webpage-citation-pill"], [data-testid*="citation-pill"], [data-testid*="citation"], button[class*="footnote"], [data-assistant-sources-trigger]'
+    ).forEach(addPill);
+    queryAllDeep(document, 'button, a[href], [role="button"]').forEach(function (el) {
+      if (looksLikeCiteChipText(el) || /footnote|citation/i.test(classNameOf(el))) addPill(el);
+    });
+    // 会話内の target=_blank リンクは ChatGPT 引用の本体であることが多い
+    conversationSourceRoots().forEach(function (root) {
+      queryAllDeep(root, 'a[href][target="_blank"], a[href][rel*="noopener"]').forEach(function (el) {
+        var href = findHrefDeep(el);
+        var title = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        addSource(map, normalizeCiteChipTitle(title) || title, href);
+      });
+      queryAllDeep(root, '[data-assistant-sources-payload]').forEach(function (el) {
+        parseAssistantSourcesPayload(el).forEach(function (item) {
+          addSource(map, item.title, item.url);
+        });
+      });
+    });
+    if (map.size > 0) return;
+    var limit = Math.min(pills.length, 10);
+    for (var i = 0; i < limit; i++) {
+      try {
+        var before = map.size;
+        var clickable = pills[i].querySelector
+          ? (pills[i].querySelector('a[href], button, [role="button"]') || pills[i])
+          : pills[i];
+        clickable.click();
+        await delay(350);
+        harvestOpenSourcePanels(map);
+        queryAllDeep(document, '[data-state="open"] a[href], [data-radix-popper-content-wrapper] a[href], [role="dialog"] a[href]').forEach(function (el) {
+          addSource(map, String(el.innerText || '').replace(/\s+/g, ' ').trim(), findHrefDeep(el));
+        });
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        await delay(120);
+        if (map.size === before && i > 2 && map.size > 0) break;
+      } catch (e) {}
+    }
+  }
+
+  function conversationSourceRoots() {
+    var roots = queryAllDeep(
+      document,
+      'main, [role="main"], [data-testid="conversation"], [data-testid*="conversation"], .conversation, [data-message-author-role], [data-message-role]'
+    );
+    var filtered = [];
+    var seen = [];
+    roots.forEach(function (root) {
+      if (!root || seen.indexOf(root) >= 0) return;
+      // ナビ・フッター配下は除外
+      if (root.closest && root.closest('nav, footer, [data-testid*="sidebar"], aside')) return;
+      seen.push(root);
+      filtered.push(root);
+    });
+    return filtered;
+  }
+
+  async function collectSourcesForSave(collectedMap) {
+    var map = new Map();
+    if (collectedMap) {
+      collectedMap.forEach(function (item) {
+        collectSourcesFromHtml(item.html, map);
+      });
+    }
+    // ページ全体ではなく会話領域だけ（ChatGPT のログイン/ナビリンク混入を防ぐ）
+    var roots = conversationSourceRoots();
+    if (roots.length) roots.forEach(function (root) { collectSourcesFromRoot(root, map); });
+    await tryCollectFromSourcesFlyout(map);
+    // ChatGPT: インライン引用 pill を開いて URL を回収
+    if (location.hostname.indexOf('chatgpt.com') >= 0 || location.hostname.indexOf('chat.openai.com') >= 0) {
+      await expandChatgptCitationPills(map);
+    }
+    var sources = [];
+    map.forEach(function (title, url) {
+      sources.push({ title: title, url: url });
+    });
+    return sources;
+  }
+
+  // --- Math (KaTeX / MathML → data-ct-math markers) ---
+
+  function languageOf(node) {
+    if (!node || !node.getAttribute) return '';
+    var className = typeof node.className === 'string' ? node.className : '';
+    var match = /(?:^|\s)(?:language|lang)-([A-Za-z0-9_+-]+)/.exec(className);
+    if (match) return match[1];
+    var data = node.getAttribute('data-language') || node.getAttribute('data-lang') || '';
+    data = String(data).trim();
+    if (/^[A-Za-z0-9_+-]+$/.test(data)) return data;
+    return '';
+  }
+
+  function classNameOf(node) {
+    if (!node) return '';
+    if (typeof node.className === 'string') return node.className;
+    if (node.className && typeof node.className.baseVal === 'string') return node.className.baseVal;
+    return (node.getAttribute && node.getAttribute('class')) || '';
+  }
+
+  function stripMathDelimiters(latex) {
+    var s = String(latex || '').trim();
+    if (/^\$\$[\s\S]*\$\$$/.test(s)) return s.replace(/^\$\$/, '').replace(/\$\$$/, '').trim();
+    if (s.length >= 2 && s.charAt(0) === '$' && s.charAt(s.length - 1) === '$' && s.charAt(1) !== '$') {
+      return s.slice(1, -1).trim();
+    }
+    if (s.indexOf('\\(') === 0 && s.lastIndexOf('\\)') === s.length - 2) return s.slice(2, -2).trim();
+    if (s.indexOf('\\[') === 0 && s.lastIndexOf('\\]') === s.length - 2) return s.slice(2, -2).trim();
+    return s;
+  }
+
+  function isDisplayMath(node) {
+    var cls = classNameOf(node).toLowerCase();
+    if (/\bkatex-display\b/.test(cls) || /\bmath-display\b/.test(cls) || /\bdisplay-math\b/.test(cls)) return true;
+    if ((node.getAttribute('display') || '').toLowerCase() === 'block') return true;
+    if ((node.getAttribute('data-display') || '').toLowerCase() === 'true') return true;
+    if (node.tagName === 'MJX-CONTAINER' && (node.getAttribute('display') || '') === 'true') return true;
+    if (node.querySelector) {
+      var math = node.querySelector('math');
+      if (math && (math.getAttribute('display') || '').toLowerCase() === 'block') return true;
+    }
+    return false;
+  }
+
+  function isMathRoot(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var cls = classNameOf(node).toLowerCase();
+    if (/\bkatex-display\b/.test(cls)) return true;
+    if (/\bkatex\b/.test(cls)) {
+      var parent = node.parentElement;
+      if (parent && /\bkatex/i.test(classNameOf(parent))) return false;
+      return true;
+    }
+    if (node.tagName === 'MJX-CONTAINER' || node.tagName === 'MATH') return true;
+    if (node.getAttribute && node.getAttribute('data-math') != null && String(node.getAttribute('data-math')).trim()) return true;
+    var testId = String(node.getAttribute && node.getAttribute('data-testid') || '').toLowerCase();
+    if (testId.indexOf('math') >= 0 && node.querySelector && node.querySelector('annotation')) return true;
+    if (/\bmath-inline\b|\bmath-display\b|\bdisplay-math\b|\binline-math\b/.test(cls) && node.querySelector && node.querySelector('annotation, .katex')) return true;
+    return false;
+  }
+
+  function extractLatex(node) {
+    if (!node) return '';
+    if (node.getAttribute) {
+      var dataMath = node.getAttribute('data-math');
+      if (dataMath && String(dataMath).trim()) return String(dataMath).trim();
+      var dataLatex = node.getAttribute('data-latex') || node.getAttribute('data-tex');
+      if (dataLatex && String(dataLatex).trim()) return String(dataLatex).trim();
+    }
+    if (node.querySelector) {
+      var ann =
+        node.querySelector('annotation[encoding="application/x-tex"]') ||
+        node.querySelector('annotation[encoding="LaTeX"]') ||
+        node.querySelector('annotation');
+      if (ann) {
+        var tex = String(ann.textContent || '').trim();
+        if (tex) return tex;
+      }
+    }
+    if (node.tagName === 'SCRIPT') {
+      var scriptTex = String(node.textContent || '').trim();
+      if (scriptTex) return scriptTex;
+    }
+    return '';
+  }
+
+  function formatMathHtml(display, latex) {
+    var body = stripMathDelimiters(latex);
+    if (!body) return '';
+    return '<span data-ct-math="' + (display ? 'display' : 'inline') + '">' + esc(body) + '</span>';
+  }
+
+  function mathFromNode(node) {
+    var latex = extractLatex(node);
+    if (!latex) {
+      var label = String((node.getAttribute && node.getAttribute('aria-label')) || '').trim();
+      return label ? esc(label) : '';
+    }
+    return formatMathHtml(isDisplayMath(node), latex);
+  }
+
+  // --- UI chrome stripping (prompt/response labels, action buttons) ---
+
+  function isActionControl(node) {
+    var label = ((node.getAttribute('aria-label') || '') + ' ' + (node.getAttribute('data-testid') || '')).toLowerCase();
+    return /copy|share|edit|regenerate|thumbs|more|menu|good|bad|コピー|共有|編集|再生成|その他/.test(label);
+  }
+
+  function plainText(html) {
+    return String(html || '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
+  }
+
+  function isResponseLabelText(text) {
+    var value = String(text || '').replace(/\s+/g, ' ').trim();
+    return /^(chatgpt|gemini)\s*(の回答|の返答| response|'?s response)?$/i.test(value)
+      || /^(あなたのプロンプト|your prompt)\s*[:：]?$/i.test(value);
+  }
+
+  function isPromptLabelNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || '').toLowerCase();
+    var cls = classNameOf(node).toLowerCase();
+    if (/query-title|prompt-label|user-query-title|query-over-plain/.test(tag + ' ' + cls)) return true;
+    var text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    return /^(あなたのプロンプト|your prompt)\s*[:：]?$/i.test(text);
+  }
+
+  function collapseDuplicatedPhrase(text) {
+    var value = String(text || '').replace(/\s+/g, ' ').trim();
+    var spaced = /^(.+?)(?:[\s\u3000]+)(?:[:：]\s*)?\1$/.exec(value);
+    if (spaced) return spaced[1].trim();
+    if (value.length >= 2 && value.length % 2 === 0) {
+      var half = value.slice(0, value.length / 2);
+      if (half && half === value.slice(value.length / 2)) return half;
+    }
+    return String(text || '');
+  }
+
+  function stripPromptPrefix(text) {
+    return collapseDuplicatedPhrase(
+      String(text || '')
+        .replace(/(?:あなたのプロンプト|Your prompt)\s*[:：]\s*/gi, '')
+        .replace(/^(?:あなたのプロンプト|Your prompt)\s*/i, '')
+        .trim(),
+    );
+  }
+
+  function stripResponseLabels(html) {
+    var result = String(html || '')
+      .replace(/<(p|h[1-6]|div|span|header)(\s[^>]*)?>([\s\S]*?)<\/\1>/gi, function (all, tag, _attrs, inner) {
+        var text = plainText(inner);
+        if (/^(chatgpt|gemini)\s*(の回答|の返答)$/i.test(text) || isResponseLabelText(text)) return '';
+        var cleaned = stripPromptPrefix(text);
+        if (!cleaned) return '';
+        if (cleaned !== text) return '<' + tag + '>' + esc(cleaned) + '</' + tag + '>';
+        return all;
+      })
+      .replace(/^\s*(?:ChatGPT|Gemini)\s*(?:の回答|の返答)\s*/i, '')
+      .replace(/^\s*(?:あなたのプロンプト|Your prompt)\s*[:：]?\s*/i, '')
+      .trim();
+    return dedupeAdjacentPlainBlocks(result);
+  }
+
+  // 同じ本文がラベル側と本文側で二重に入るのを防ぐ
+  function dedupeAdjacentPlainBlocks(html) {
+    var parts = String(html || '').match(/<p\b[^>]*>[\s\S]*?<\/p>|<[^>]+>|[^<]+/gi) || [];
+    var out = [];
+    var prevText = '';
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      var text = plainText(part).replace(/\s+/g, ' ').trim();
+      if (/^<p\b/i.test(part) && text && text === prevText) continue;
+      if (!/^</.test(part) && text && text === prevText) continue;
+      if (text) prevText = text;
+      out.push(part);
+    }
+    return out.join('').trim();
+  }
+
+  function isChrome(html) {
+    if (/data-ct-media=/i.test(html || '') || /data-ct-math=/i.test(html || '') || /https?:\/\//i.test(html || '')) return false;
+    var text = plainText(html);
+    if (/^(chatgpt:?|gemini|思考中|thinking)$/i.test(text)) return true;
+    if (isResponseLabelText(text)) return true;
+    var stripped = text
+      .replace(/chatgpt:?/ig, '')
+      .replace(/(?:chatgpt|gemini)\s*(?:の回答|の返答)/ig, '')
+      .replace(/(?:あなたのプロンプト|your prompt)\s*[:：]?/ig, '')
+      .replace(/ウェブを検索しています/g, '')
+      .replace(/ウェブを検索中/g, '')
+      .replace(/検索しています/g, '')
+      .replace(/searching the web/ig, '')
+      .replace(/searched the web/ig, '')
+      .replace(/\d+\s*\./g, '')
+      .replace(/\s+/g, '');
+    return stripped.length === 0;
+  }
+
+  var captureClaimed = new Set();
+
+  // --- Media: images, map widgets, screenshot captures ---
+
+  function resetMedia() {
+    mediaElements.clear();
+    mediaMeta.clear();
+    adImageSrcs.clear();
+    mediaSeq = 0;
+    captureClaimed.clear();
+    citationPopoverLinks.clear();
+    citationPopoverTried.clear();
+    citationPopoverByNode = new WeakMap();
+    citationPopoverOpened = new WeakSet();
+  }
+
+  function registerMedia(el, kind, extra) {
+    var id = 'm' + (++mediaSeq);
+    mediaElements.set(id, el);
+    var entry = { id: id, kind: kind };
+    if (extra) {
+      Object.keys(extra).forEach(function (key) { entry[key] = extra[key]; });
+    }
+    mediaMeta.set(id, entry);
+    return id;
+  }
+
+  function imageSrc(node) {
+    if (!node) return '';
+    var src = '';
+    try { src = node.currentSrc || ''; } catch (e) {}
+    if (!src) src = node.getAttribute('src') || '';
+    if (!src) {
+      var srcset = node.getAttribute('srcset') || '';
+      if (srcset) src = String(srcset).split(',')[0].trim().split(/\s+/)[0] || '';
+    }
+    src = String(src || '').trim();
+    if (!src) return '';
+    if (/^(https?:|data:|blob:)/i.test(src)) return src;
+    try { return new URL(src, location.href).href; } catch (e) { return ''; }
+  }
+
+  function isTinyVisual(el) {
+    var rect = el.getBoundingClientRect();
+    var w = Math.max(rect.width, el.offsetWidth || 0, Number(el.getAttribute('width')) || 0);
+    var h = Math.max(rect.height, el.offsetHeight || 0, Number(el.getAttribute('height')) || 0);
+    return w > 0 && h > 0 && (w < 48 || h < 48);
+  }
+
+  function looksLikeMap(el) {
+    return hasMapSignal(mapSignalBlob(el));
+  }
+
+  function mapSignalBlob(el) {
+    var parts = [];
+    var cur = el;
+    for (var depth = 0; cur && depth < 4; depth++) {
+      if (!cur.getAttribute) break;
+      parts.push(cur.getAttribute('aria-label') || '');
+      parts.push(cur.getAttribute('title') || '');
+      parts.push(cur.getAttribute('data-testid') || '');
+      parts.push(typeof cur.className === 'string' ? cur.className : '');
+      parts.push(cur.id || '');
+      parts.push(cur.getAttribute('src') || '');
+      parts.push(cur.getAttribute('data-src') || '');
+      cur = cur.parentElement;
+    }
+    return parts.join(' ').toLowerCase();
+  }
+
+  function hasMapSignal(blob) {
+    if (!blob) return false;
+    if (/maps\.google|google\.com\/maps|openstreetmap|mapbox\.com|leaflet|地図|geocode|maps\.apple/.test(blob)) return true;
+    return /\bmap\b/.test(blob) && /(google|osm|mapbox|leaflet|embed|iframe|place|geo)/.test(blob);
+  }
+
+  function parseMapUrl(url) {
+    var mapState = {};
+    var sourceUrl = String(url || '').trim();
+    if (!sourceUrl) return { sourceUrl: '', mapState: mapState };
+    try {
+      var u = new URL(sourceUrl);
+      var at = /@(-?\d+\.?\d*),(-?\d+\.?\d*),(\d+\.?\d*)z/.exec(u.href);
+      if (at) {
+        mapState.lat = Number(at[1]);
+        mapState.lng = Number(at[2]);
+        mapState.zoom = Number(at[3]);
+      }
+      var d3 = /!3d(-?\d+\.?\d*)/.exec(u.href);
+      var d2 = /!2d(-?\d+\.?\d*)/.exec(u.href);
+      if (d3 && d2) {
+        mapState.lat = Number(d3[1]);
+        mapState.lng = Number(d2[1]);
+      }
+      var q = u.searchParams.get('q') || u.searchParams.get('query');
+      if (q) mapState.query = q;
+      var ll = u.searchParams.get('ll');
+      if (ll) {
+        var parts = ll.split(',');
+        if (parts.length >= 2 && Number.isFinite(Number(parts[0])) && Number.isFinite(Number(parts[1]))) {
+          mapState.lat = Number(parts[0]);
+          mapState.lng = Number(parts[1]);
+        }
+      }
+      var z = u.searchParams.get('z') || u.searchParams.get('zoom');
+      if (z && Number.isFinite(Number(z))) mapState.zoom = Number(z);
+      var marker = u.searchParams.get('marker');
+      if (marker) {
+        var m = marker.split(',');
+        if (m.length >= 2 && Number.isFinite(Number(m[0])) && Number.isFinite(Number(m[1]))) {
+          mapState.lat = Number(m[0]);
+          mapState.lng = Number(m[1]);
+        }
+      }
+    } catch (e) {}
+    return { sourceUrl: sourceUrl, mapState: mapState };
+  }
+
+  function extractMapInfo(node) {
+    var sourceUrl = '';
+    var mapState = {};
+    var tag = node.tagName;
+    if (tag === 'IFRAME') {
+      sourceUrl = resolveHref(node.getAttribute('src') || '') || String(node.src || '').trim();
+      try {
+        if (node.contentWindow && node.contentWindow.location) {
+          var loc = String(node.contentWindow.location.href || '');
+          if (/^https?:\/\//i.test(loc)) sourceUrl = loc;
+        }
+      } catch (e) {
+        console.info('[ChatTaker] map iframe cross-origin, skip contentDocument');
+      }
+    } else if (node.querySelector) {
+      var iframe = node.querySelector('iframe[src]');
+      if (iframe) sourceUrl = resolveHref(iframe.getAttribute('src') || '') || String(iframe.src || '').trim();
+    }
+    if (sourceUrl) {
+      var parsed = parseMapUrl(sourceUrl);
+      sourceUrl = parsed.sourceUrl || sourceUrl;
+      mapState = parsed.mapState || {};
+    }
+    return { sourceUrl: sourceUrl, mapState: mapState };
+  }
+
+  function isMapNode(node) {
+    if (!node || !node.tagName || captureClaimed.has(node) || isTinyVisual(node)) return false;
+    if (node.closest && node.closest('button, [data-message-actions], [data-assistant-message-actions]')) return false;
+    if (!hasMapSignal(mapSignalBlob(node))) return false;
+    var tag = node.tagName;
+    if (tag === 'IFRAME') return true;
+    if (tag === 'CANVAS') return true;
+    if (node.getAttribute && node.getAttribute('role') === 'img') return true;
+    return false;
+  }
+
+  /** 同じ src の画像は 1 件として扱う（再描画・差分収集で ID が増殖しない） */
+  function findMediaIdBySrc(src) {
+    var found = '';
+    if (!src) return found;
+    mediaMeta.forEach(function (entry, id) {
+      if (!found && entry && entry.kind === 'image' && entry.src === src) found = id;
+    });
+    return found;
+  }
+
+  function registerImageNode(node) {
+    if (isTinyVisual(node)) return '';
+    var src = imageSrc(node);
+    if (!src) return '';
+    if (adImageSrcs.has(src)) return '';
+    var id = findMediaIdBySrc(src);
+    if (id) {
+      if (node && node.isConnected) mediaElements.set(id, node);
+    } else {
+      id = registerMedia(node, 'image', { src: src });
+    }
+    return '<img data-ct-media="' + esc(id) + '" alt="">';
+  }
+
+  function markCaptureClaimed(node) {
+    if (!node) return;
+    captureClaimed.add(node);
+    queryAllDeep(node, 'canvas, iframe, [role="img"]').forEach(function (child) {
+      captureClaimed.add(child);
+    });
+  }
+
+  function registerMapNode(node) {
+    if (!node || captureClaimed.has(node) || isTinyVisual(node)) return '';
+    if (node.closest && node.closest('button, [data-message-actions], [data-assistant-message-actions]')) return '';
+    console.info('[ChatTaker] map detected');
+    var info = extractMapInfo(node);
+    console.info('[ChatTaker] map source URL:', info.sourceUrl || '(none)');
+    console.info('[ChatTaker] map state:', JSON.stringify(info.mapState || {}));
+    var extra = {};
+    if (info.sourceUrl) extra.sourceUrl = info.sourceUrl;
+    if (info.mapState && Object.keys(info.mapState).length) extra.mapState = info.mapState;
+    var id = registerMedia(node, 'map', extra);
+    markCaptureClaimed(node);
+    return '<img data-ct-media="' + esc(id) + '" alt="map">';
+  }
+
+  function registerCaptureNode(node) {
+    if (!node || captureClaimed.has(node) || isTinyVisual(node)) return '';
+    if (node.closest && node.closest('button, [data-message-actions], [data-assistant-message-actions]')) return '';
+    var id = registerMedia(node, 'capture', {});
+    markCaptureClaimed(node);
+    return '<img data-ct-media="' + esc(id) + '" alt="capture">';
+  }
+
+  function shouldCaptureAsScreenshot(node) {
+    if (!node || !node.tagName || captureClaimed.has(node)) return false;
+    if (node.closest && node.closest('button, [data-message-actions], [data-assistant-message-actions]')) return false;
+    if (isTinyVisual(node)) return false;
+    if (isMapNode(node)) return false;
+    var tag = node.tagName;
+    if (tag === 'CANVAS') return true;
+    if (tag === 'IFRAME' && looksLikeMap(node)) return true;
+    if (node.getAttribute && node.getAttribute('role') === 'img' && looksLikeMap(node)) return true;
+    return false;
+  }
+
+  // --- Place cards → Google Maps search links ---
+
+  function mapsSearchUrl(query) {
+    var q = String(query || '').trim();
+    if (!q) return '';
+    return 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(q);
+  }
+
+  function placeCardText(node) {
+    return String(node.innerText || node.textContent || '')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function looksLikePlaceCardText(text) {
+    if (!text || text.length > 400) return false;
+    if (/\d(?:\.\d)?\s*stars?\s*rating/i.test(text) && (/📍|Open\s*·|Closes\s+/i.test(text) || /営業/.test(text))) return true;
+    if (/クリックするとサイドパネルが開き/.test(text) && text.length < 120) return true;
+    // ChatGPT 地図下の店舗リンク: 「西松屋 …★ 3.5•子供服店」
+    if (/★\s*\d(?:\.\d)?/.test(text) && /[·•]/.test(text) && text.length < 200) return true;
+    return false;
+  }
+
+  function isPlaceCardRoot(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (!looksLikePlaceCardText(placeCardText(node))) return false;
+    if (!node.querySelectorAll) return true;
+    var kids = node.querySelectorAll('*');
+    for (var i = 0; i < kids.length; i++) {
+      if (looksLikePlaceCardText(placeCardText(kids[i]))) return false;
+    }
+    return true;
+  }
+
+  function extractPlaceName(node, text) {
+    var nameEl = null;
+    if (node.querySelector) {
+      try {
+        nameEl = node.querySelector('strong, b, h1, h2, h3, h4, [class*="title"], [class*="name"], [class*="place"]');
+      } catch (e) {
+        nameEl = node.querySelector('strong, b, h1, h2, h3, h4');
+      }
+    }
+    if (nameEl) {
+      var fromEl = String(nameEl.innerText || nameEl.textContent || '').replace(/\s+/g, ' ').trim();
+      if (
+        fromEl &&
+        fromEl.length >= 2 &&
+        fromEl.length <= 80 &&
+        !/\bstars?\s*rating\b/i.test(fromEl) &&
+        !/★/.test(fromEl)
+      ) {
+        return fromEl;
+      }
+    }
+    var rated = /^(.+?)(\d(?:\.\d)?)\s*stars?\s*rating/i.exec(text);
+    if (rated) {
+      var name = String(rated[1] || '').trim();
+      if (name && name.length <= 80) return name;
+    }
+    var starred = /^(.+?)\s*★\s*\d(?:\.\d)?/.exec(text);
+    if (starred) {
+      var starName = String(starred[1] || '')
+        .replace(/^\d(?:\.\d)?\s*/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (starName && starName.length >= 2 && starName.length <= 80) return starName;
+    }
+    var panel = /^(.+?)クリックするとサイドパネル/.exec(text);
+    if (panel) {
+      var panelName = String(panel[1] || '').trim();
+      if (panelName && panelName.length <= 80) return panelName;
+    }
+    return '';
+  }
+
+  function placeCardHtml(node) {
+    var text = placeCardText(node);
+    var name = extractPlaceName(node, text);
+    if (!name) return '';
+    var url = mapsSearchUrl(name);
+    if (!url) return '';
+    var rest = text;
+    var idx = rest.indexOf(name);
+    if (idx >= 0) rest = rest.slice(idx + name.length);
+    rest = rest
+      .replace(/クリックするとサイドパネルが開き、詳細が表示されます/g, '')
+      .replace(/Opens? (?:in )?a side panel[^.。]*/gi, '')
+      .replace(/地図データは現在利用不可です/g, '')
+      .replace(/Map data (?:is )?currently unavailable\.?/gi, '')
+      .replace(/(\d(?:\.\d)?)\s*stars?\s*rating\1?/gi, '$1')
+      .replace(/★\s*/g, '')
+      .replace(/\s*[•]\s*/g, ' · ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    var html =
+      '<p><strong><a data-ct-keep-link="1" href="' + esc(url) + '">' + esc(name) + '</a></strong>';
+    if (rest) html += '<br>' + esc(rest);
+    html += '</p>';
+    return html;
+  }
+
+  // --- HTML sanitize / message build ---
+
+  /**
+   * ChatGPT のスポンサー広告リンク。oppref / olref は広告配信のトラッキング、
+   * utm_medium=paid も併用される。広告が出ていない会話では何もしない。
+   */
+  function isPaidAdUrl(url) {
+    var value = String(url || '').replace(/&amp;/gi, '&');
+    if (!value) return false;
+    if (/(?:[?&#])(?:oppref|olref)=/i.test(value) || /(?:oppref|olref)%3D/i.test(value)) return true;
+    try {
+      var u = new URL(value, location.href);
+      if ((u.searchParams.get('utm_medium') || '').toLowerCase() === 'paid') return true;
+    } catch (e) {}
+    return /(?:[?&#])utm_medium=paid(?:&|#|$)/i.test(value) || /utm_medium%3Dpaid/i.test(value);
+  }
+
+  function elementText(node) {
+    return String((node && (node.innerText || node.textContent)) || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function isAdDisclosureStartText(text) {
+    return /^(?:この広告について|about this ad)\s*[:：]?\s*$/i.test(text || '');
+  }
+
+  function isAdDisclosureEndText(text) {
+    return /^(?:この広告を報告する|report this ad)\s*[:：]?\s*$/i.test(text || '');
+  }
+
+  function isAdDisclosureDetailText(text) {
+    return /スポンサー|sponsored|この広告が表示されている理由|why you(?:'|’)re seeing this ad|why am i seeing this ad|広告主と共有|information shared with the advertiser|データは非公開|your data stays private|この広告を非表示|hide this ad/i.test(text || '');
+  }
+
+  /** 見出しだけで広告パネルと分かる短い文言（本文に単独で現れることはない） */
+  function isAdDetailHeadingText(text) {
+    return /^(?:スポンサー|sponsored(?: by)?|この広告が表示されている理由|why you(?:'|’)re seeing this ad|why am i seeing this ad|広告主と共有される情報|information shared with the advertiser|データは非公開のままになります|your data stays private)\s*[:：]?\s*$/i.test(text || '');
+  }
+
+  /** 単独で出る広告 UI の文言（報告 / 非表示 / この広告について / 広告ラベル） */
+  function isAdChromeText(text) {
+    return isAdDisclosureStartText(text) || isAdDisclosureEndText(text) || isAdLabelText(text)
+      || /^(?:この広告を非表示にする|hide this ad)\s*[:：]?\s*$/i.test(text || '');
+  }
+
+  function isAdLabelText(text) {
+    return /^(?:広告|sponsored|ad)$/i.test(text || '');
+  }
+
+  /** 広告として捨てた画像の src。再収集や差分マージで復活させない。 */
+  var adImageSrcs = new Set();
+
+  function rememberAdImages(node) {
+    if (!node || node.nodeType !== 1) return;
+    var list = [];
+    if (String(node.tagName || '').toUpperCase() === 'IMG') list.push(node);
+    queryAllDeep(node, 'img').forEach(function (img) { list.push(img); });
+    list.forEach(function (img) {
+      var src = imageSrc(img);
+      if (src) adImageSrcs.add(src);
+    });
+  }
+
+  function paidAnchorsIn(node) {
+    var list = [];
+    if (!node || node.nodeType !== 1) return list;
+    if (String(node.tagName || '').toUpperCase() === 'A' && isPaidAdUrl(resolveHrefFromNode(node))) list.push(node);
+    queryAllDeep(node, 'a[href], [data-href], [data-url], [data-source-url], [data-absolute-url]').forEach(function (el) {
+      if (isPaidAdUrl(resolveHrefFromNode(el))) list.push(el);
+    });
+    return list;
+  }
+
+  /** パネル定型文と広告リンク文を除いた残りの本文。これが短い要素だけが「広告そのもの」。 */
+  function nonAdTextLength(node, text) {
+    var rest = String(text || '')
+      .replace(/この広告について|about this ad/ig, ' ')
+      .replace(/この広告を報告する|report this ad/ig, ' ')
+      .replace(/この広告を非表示にする|hide this ad/ig, ' ')
+      .replace(/スポンサー\s*[:：]?|sponsored(?: by)?\s*[:：]?/ig, ' ')
+      .replace(/この広告が表示されている理由|why you(?:'|’)re seeing this ad|why am i seeing this ad/ig, ' ')
+      .replace(/この広告は、?広告配信に使用される[^。]*。/g, ' ')
+      .replace(/詳細を見る|learn more/ig, ' ')
+      .replace(/広告主と共有される情報|information shared with the advertiser/ig, ' ')
+      .replace(/広告主には、?[^。]*提供されます。/g, ' ')
+      .replace(/データは非公開のままになります|your data stays private/ig, ' ')
+      .replace(/チャットと個人情報のいずれも広告主と共有されていません。/g, ' ')
+      .replace(/(^|\s)(?:広告|ad)(?=\s|$)/ig, ' ');
+    paidAnchorsIn(node).forEach(function (a) {
+      var t = elementText(a);
+      if (t) rest = rest.split(t).join(' ');
+    });
+    return rest.replace(/\s+/g, '').length;
+  }
+
+  /**
+   * 「この広告について」〜「この広告を報告する」の説明パネルを含み、それ以外の本文がほぼ無い要素。
+   * 回答本文と広告を両方含む親コンテナは対象にしない（本文を巻き込まないため）。
+   */
+  function isAdDisclosureElement(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var text = elementText(node);
+    if (!text || text.length > 2600) return false;
+    if (!/この広告について|about this ad/i.test(text)) return false;
+    if (!/この広告を報告する|report this ad/i.test(text)) return false;
+    if (!isAdDisclosureDetailText(text)) return false;
+    return nonAdTextLength(node, text) <= 320;
+  }
+
+  /** 広告のタイトル・本文・画像だけで構成された要素。 */
+  function isAdCreativeElement(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = String(node.tagName || '').toUpperCase();
+    if (tag === 'A') return isPaidAdUrl(resolveHrefFromNode(node));
+    var text = elementText(node);
+    if (text.length > 1600) return false;
+    if (!paidAnchorsIn(node).length) return false;
+    return nonAdTextLength(node, text) <= 160;
+  }
+
+  /** 出典バッジを開いたときのポップオーバー。保存中に開くので本文に混ぜない。 */
+  function isPopoverPanel(node) {
+    if (!node || node.nodeType !== 1 || !node.getAttribute) return false;
+    var role = String(node.getAttribute('role') || '').toLowerCase();
+    if (role === 'dialog' || role === 'tooltip' || role === 'alertdialog') return true;
+    var comp = String(node.getAttribute('data-d-component') || '').toLowerCase();
+    if (comp && comp !== 'popover-trigger' && /popover|tooltip|dialog|overlay/.test(comp)) return true;
+    if (node.hasAttribute('data-radix-popper-content-wrapper')) return true;
+    var id = node.id;
+    if (id) {
+      var trigger = null;
+      try { trigger = document.querySelector('[aria-controls="' + id.replace(/"/g, '\\"') + '"]'); } catch (e) {}
+      if (trigger && trigger !== node && !trigger.contains(node)) {
+        var tcomp = String(trigger.getAttribute('data-d-component') || '').toLowerCase();
+        if (tcomp === 'popover-trigger' || trigger.getAttribute('aria-haspopup')) return true;
+      }
+    }
+    return false;
+  }
+
+  function isImageOnlyElement(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (elementText(node)) return false;
+    var tag = String(node.tagName || '').toUpperCase();
+    if (tag === 'IMG' || tag === 'PICTURE' || tag === 'CANVAS') return true;
+    return !!(node.querySelector && node.querySelector('img, picture, canvas, [role="img"]'));
+  }
+
+  function adChildSkip(node) {
+    var kids = [];
+    var i;
+    for (i = 0; i < node.childNodes.length; i++) kids.push(node.childNodes[i]);
+    var skip = [];
+    function mark(child) {
+      if (child && skip.indexOf(child) < 0) skip.push(child);
+    }
+    var hasAd = false;
+    for (i = 0; i < kids.length; i++) {
+      var child = kids[i];
+      if (!child || child.nodeType !== 1) continue;
+      var childText = elementText(child);
+      if (isAdDisclosureElement(child) || isAdCreativeElement(child)) {
+        mark(child);
+        hasAd = true;
+        continue;
+      }
+      if (isAdDetailHeadingText(childText)) {
+        // 見出し + 直後の説明ブロック
+        mark(child);
+        var n = i + 1;
+        while (n < kids.length && kids[n].nodeType !== 1) n++;
+        if (n < kids.length && !isAdDetailHeadingText(elementText(kids[n])) && !isAdChromeText(elementText(kids[n])) && elementText(kids[n]).length < 400) mark(kids[n]);
+        hasAd = true;
+        continue;
+      }
+      if (isAdChromeText(childText) && !isAdDisclosureStartText(childText)) {
+        mark(child);
+        hasAd = true;
+        continue;
+      }
+      if (!isAdDisclosureStartText(childText)) continue;
+      var end = -1;
+      var sawDetail = false;
+      var j;
+      for (j = i; j < kids.length && j < i + 40; j++) {
+        var jt = kids[j].nodeType === 1 ? elementText(kids[j]) : String(kids[j].nodeValue || '').replace(/\s+/g, ' ').trim();
+        if (isAdDisclosureDetailText(jt)) sawDetail = true;
+        if (isAdDisclosureEndText(jt)) end = j;
+      }
+      if (end <= i || !sawDetail) {
+        // 「この広告について」単独（折りたたみ見出しだけ残っている）
+        mark(child);
+        hasAd = true;
+        continue;
+      }
+      var k;
+      for (k = i; k <= end; k++) mark(kids[k]);
+      var p = i - 1;
+      while (p >= 0) {
+        var prev = kids[p];
+        if (prev.nodeType === 3 && !String(prev.nodeValue || '').trim()) { p--; continue; }
+        if (prev.nodeType === 1 && (isImageOnlyElement(prev) || isAdLabelText(elementText(prev)) || isAdCreativeElement(prev))) {
+          mark(prev);
+          p--;
+          continue;
+        }
+        break;
+      }
+      hasAd = true;
+      i = end;
+    }
+    if (hasAd) skip.forEach(rememberAdImages);
+    return skip;
+  }
+
+  function sanitizeKids(node, inList) {
+    var skip = adChildSkip(node);
+    var html = '';
+    if (node.shadowRoot) html += sanitize(node.shadowRoot, inList);
+    node.childNodes.forEach(function (child) {
+      if (skip.indexOf(child) >= 0) return;
+      html += sanitize(child, inList);
+    });
+    return html;
+  }
+
+  function sanitize(node, inList) {
+    if (!node) return '';
+    if (node.nodeType === 3) return esc(node.nodeValue || '');
+    if (node.nodeType === 11) return sanitizeKids(node, inList);
+    if (node.nodeType !== 1) return '';
+    if (isAdDisclosureElement(node) || isAdCreativeElement(node)) {
+      rememberAdImages(node);
+      return '';
+    }
+    if (isPopoverPanel(node)) return '';
+    var tag = node.tagName;
+    if (tag === 'STYLE' || tag === 'SVG' || tag === 'NOSCRIPT' || tag === 'TEXTAREA' || tag === 'INPUT') return '';
+    if (tag === 'SCRIPT') {
+      var scriptType = String(node.getAttribute('type') || '').toLowerCase();
+      if (scriptType.indexOf('math/tex') >= 0) {
+        var scriptLatex = extractLatex(node);
+        if (scriptLatex) return formatMathHtml(scriptType.indexOf('mode=display') >= 0, scriptLatex);
+      }
+      return '';
+    }
+    if (isMathRoot(node)) return mathFromNode(node);
+    if (isPromptLabelNode(node)) return '';
+    if (isSourcesChrome(node)) return extractLinksHtml(node);
+    if (isPlaceCardRoot(node)) {
+      var card = placeCardHtml(node);
+      if (card) return card;
+    }
+    if (isCitationPill(node)) return linkFromCitation(node);
+    if (tag === 'IMG') return registerImageNode(node);
+    if (isMapNode(node)) return registerMapNode(node);
+    if (shouldCaptureAsScreenshot(node)) return registerCaptureNode(node);
+    if (node.hasAttribute('data-message-attribution') || node.hasAttribute('data-assistant-message-actions') || node.hasAttribute('data-message-actions') || node.hasAttribute('data-copy-message') || node.hasAttribute('data-share-message')) return '';
+    var childInList = inList || tag === 'UL' || tag === 'OL';
+    var inner = sanitizeKids(node, childInList);
+    if (isResponseLabelText(plainText(inner)) || isResponseLabelText(String(node.innerText || node.textContent || ''))) {
+      var leftover = inner.replace(/<[^>]+>/g, '').replace(/(?:ChatGPT|Gemini)\s*(?:の回答|の返答)/ig, '').replace(/(?:あなたのプロンプト|Your prompt)\s*[:：]?/ig, '').replace(/\s+/g, '');
+      if (!leftover) return '';
+    }
+    if (tag !== 'A' && (tag === 'BUTTON' || (node.getAttribute && node.getAttribute('role') === 'button'))) {
+      if (isCitationPill(node)) return linkFromCitation(node);
+      var buttonPop = cachedPopoverLinks(node);
+      if (buttonPop.length) {
+        var buttonChipText = normalizeCiteChipTitle(plainText(inner));
+        var buttonChip = citationChipHtml(node, buttonPop, buttonChipText);
+        if (buttonChip.html) {
+          recordCitationDebug(node, buttonChip.html, buttonChip.inline ? 'popover-inline' : 'popover', { resolvedHref: buttonPop[0].href });
+          return buttonChip.html;
+        }
+      }
+      if (isActionControl(node)) return '';
+      if (/data-ct-media=/.test(inner)) return inner;
+      // 銘柄カードなど、ボタン内のリンク（Verizon Communications → URL）はラベルに潰さない
+      if (/<a\s/i.test(inner)) return inner;
+      var buttonHref = resolveHrefFromNode(node);
+      if (buttonHref && !isNoiseSourceUrl(buttonHref)) {
+        var buttonText = plainText(inner);
+        if (buttonText && buttonText.length <= 120) return '<p><a href="' + esc(buttonHref) + '">' + esc(buttonText) + '</a></p>';
+      }
+      var buttonLabel = plainText(inner);
+      if (!buttonLabel) return '';
+      if (buttonLabel.length > 80) return inner;
+      return '<p>' + esc(buttonLabel) + '</p>';
+    }
+    if (tag === 'BR') return '<br>';
+    if (tag === 'HR') return '<hr>';
+    if (tag === 'A') {
+      if (isCitationPill(node) || looksLikeCiteChipText(node)) return linkFromCitation(node);
+      var href = resolveHrefFromNode(node);
+      var anchorText = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+      var textUrl = firstHttpUrl(anchorText || inner);
+      if (textUrl && (!href || isNoiseSourceUrl(href))) href = textUrl;
+      if (href && isNoiseSourceUrl(href)) {
+        if (!isPaidAdUrl(href)) recordCitationDebug(node, inner, 'dropped-anchor', { resolvedHref: href, noiseFiltered: [href] });
+        return inner;
+      }
+      if (!href) {
+        if (anchorText) recordCitationDebug(node, inner, 'dropped-anchor', { resolvedHref: '' });
+        return inner;
+      }
+      if (!inner.replace(/<[^>]+>/g, '').trim()) inner = esc(anchorText || href);
+      return '<a href="' + esc(href) + '">' + inner + '</a>';
+    }
+    var keep = { P:1, STRONG:1, B:1, EM:1, I:1, CODE:1, PRE:1, UL:1, OL:1, LI:1, H1:1, H2:1, H3:1, H4:1, BLOCKQUOTE:1, TABLE:1, THEAD:1, TBODY:1, TR:1, TH:1, TD:1 };
+    if (!keep[tag] || (tag === 'LI' && !inList)) return inner;
+    var name = tag.toLowerCase();
+    var lang = '';
+    if (tag === 'CODE' || tag === 'PRE') {
+      lang = languageOf(node);
+      if (!lang && tag === 'PRE' && node.querySelector) {
+        var code = node.querySelector('code');
+        if (code) lang = languageOf(code);
+      }
+    }
+    if (lang) return '<' + name + ' class="language-' + esc(lang) + '">' + inner + '</' + name + '>';
+    return '<' + name + '>' + inner + '</' + name + '>';
+  }
+
+  function collectCapturePlaceholders(root) {
+    var html = '';
+    var mapCandidates = [];
+    var captureCandidates = [];
+    queryAllDeep(root, 'canvas, iframe, [role="img"]').forEach(function (el) {
+      if (captureClaimed.has(el)) return;
+      if (isMapNode(el)) mapCandidates.push(el);
+      else if (shouldCaptureAsScreenshot(el)) captureCandidates.push(el);
+    });
+    outermost(mapCandidates).forEach(function (el) {
+      if (captureClaimed.has(el)) return;
+      html += registerMapNode(el);
+    });
+    outermost(captureCandidates).forEach(function (el) {
+      if (captureClaimed.has(el)) return;
+      html += registerCaptureNode(el);
+    });
+    return html;
+  }
+
+  function contentRoot(el) {
+    var copy = el.querySelector('[data-user-message-copy]');
+    if (copy) return copy;
+    var markdownBody = el.querySelector('.markdown');
+    if (markdownBody) return markdownBody;
+    return el;
+  }
+
+  function buildMessage(el, role) {
+    var root = contentRoot(el);
+    var html = sanitize(root).replace(/\u00a0/g, ' ').trim();
+    // 位置が分からないキャプチャは末尾ではなく先頭へ置く
+    var unknownCapture = collectCapturePlaceholders(root);
+    if (unknownCapture) html = (unknownCapture + (html ? html : '')).replace(/\u00a0/g, ' ').trim();
+    html = stripResponseLabels(html.replace(/\u00a0/g, ' ').trim());
+    html = mergeMissingLinks(html, extractLinksHtml(el));
+    if (role !== 'user') html = replaceBareCiteChipsInHtml(html);
+    if (role === 'user') {
+      var userText = stripPromptPrefix(plainText(html));
+      if (userText && userText !== plainText(html)) html = '<p>' + esc(userText) + '</p>';
+    }
+    if (!html) {
+      var text = (root.innerText || '').replace(/\u00a0/g, ' ').trim();
+      if (text && !isResponseLabelText(text)) html = '<p>' + esc(text) + '</p>';
+    }
+    if (!html || isChrome(html)) return null;
+    var media = [];
+    String(html).replace(/data-ct-media="([^"]+)"/g, function (_all, id) {
+      var entry = mediaMeta.get(id);
+      if (entry) media.push(entry);
+      return _all;
+    });
+    return { role: role, html: html, media: media };
+  }
+
+  function isStreaming() {
+    var buttons = queryAllDeep(document, 'button');
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      var testId = (btn.getAttribute('data-testid') || '').toLowerCase();
+      if (testId.indexOf('stop') >= 0) return true;
+      var label = ((btn.getAttribute('aria-label') || '') + ' ' + (btn.innerText || '')).toLowerCase();
+      if (label.indexOf('stop streaming') >= 0 || label.indexOf('stop generating') >= 0 || label.indexOf('生成を停止') >= 0 || label.indexOf('停止する') >= 0) return true;
+    }
+    return false;
+  }
+
+  function findScroller(doc, seed) {
+    var node = seed ? seed.parentElement : (doc.querySelector('main') || null);
+    while (node && node !== doc.body) {
+      var style = getComputedStyle(node);
+      var scrollable = style.overflowY === 'auto' || style.overflowY === 'scroll' || style.overflowY === 'overlay';
+      if (scrollable && node.scrollHeight > node.clientHeight + 20) return node;
+      node = node.parentElement;
+    }
+    return doc.scrollingElement || doc.documentElement;
+  }
+
+  function bytesToBase64(bytes) {
+    var chunk = 0x8000;
+    var parts = [];
+    for (var i = 0; i < bytes.length; i += chunk) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)));
+    }
+    return btoa(parts.join(''));
+  }
+
+  async function fetchImagePayload(src) {
+    if (!src) return { ok: false, error: 'empty src' };
+    try {
+      if (/^data:/i.test(src)) {
+        var comma = src.indexOf(',');
+        if (comma < 0) return { ok: false, error: 'bad data url' };
+        var header = src.slice(0, comma);
+        var mimeMatch = /data:([^;]+)/i.exec(header);
+        var mime = mimeMatch ? mimeMatch[1] : 'image/png';
+        var data = src.slice(comma + 1);
+        if (/;base64/i.test(header)) {
+          return { ok: true, mime: mime, base64: data };
+        }
+        return { ok: true, mime: mime, base64: btoa(unescape(encodeURIComponent(data))) };
+      }
+      if (/^blob:/i.test(src) || /^https?:/i.test(src)) {
+        // CDN 画像は Access-Control-Allow-Origin:* のことがあり credentials:include だと CORS で落ちる。
+        // <img> 用に CORS 無しでキャッシュされた応答も fetch を失敗させるので、条件を変えて順に試す。
+        var attempts = [
+          { credentials: 'include', cache: 'force-cache' },
+          { credentials: 'omit', cache: 'default' },
+          { credentials: 'omit', cache: 'reload' },
+        ];
+        var lastError = '';
+        for (var attempt = 0; attempt < attempts.length; attempt++) {
+          try {
+            var res = await fetch(src, attempts[attempt]);
+            if (!res.ok) { lastError = 'http ' + res.status; continue; }
+            var buffer = await res.arrayBuffer();
+            var mimeType = (res.headers.get('content-type') || 'image/png').split(';')[0].trim() || 'image/png';
+            if (buffer.byteLength) return { ok: true, mime: mimeType, base64: bytesToBase64(new Uint8Array(buffer)) };
+            lastError = 'empty body';
+          } catch (fetchError) {
+            lastError = String(fetchError && fetchError.message ? fetchError.message : fetchError);
+          }
+        }
+        return { ok: false, error: lastError || 'fetch failed' };
+      }
+      return { ok: false, error: 'unsupported src' };
+    } catch (error) {
+      return { ok: false, error: String(error && error.message ? error.message : error) };
+    }
+  }
+
+  window.__ctFetchImage = function (src) {
+    return fetchImagePayload(String(src || ''));
+  };
+
+  window.__ctPreparePrint = function () {
+    if (document.getElementById('ct-print-style')) return true;
+    var style = document.createElement('style');
+    style.id = 'ct-print-style';
+    style.textContent = [
+      'nav, aside, header, [data-testid="sidebar"], [data-testid="left-sidebar"],',
+      '[data-testid="conversation-turn-sidebar"], [class*="Sidebar"], [class*="sidebar"],',
+      '[class*="nav-"], form textarea, form [contenteditable="true"],',
+      'button[data-testid="composer-speech-button"], [data-testid="composer-plus-btn"],',
+      '[aria-label*="サイドバー"], [aria-label*="sidebar"], [aria-label*="サイド バー"] {',
+      '  display: none !important;',
+      '}',
+      'main, [role="main"], .conversation, [data-testid="conversation"] {',
+      '  max-width: 100% !important;',
+      '  width: 100% !important;',
+      '}'
+    ].join('\n');
+    document.documentElement.appendChild(style);
+    return true;
+  };
+
+  window.__ctRestorePrint = function () {
+    var style = document.getElementById('ct-print-style');
+    if (style) style.remove();
+    return true;
+  };
+
+  function stampMedia(message, el) {
+    if (!message || !message.media || !message.media.length) return;
+    var messageId = '';
+    if (el && el.getAttribute) {
+      messageId =
+        el.getAttribute('data-message-id') ||
+        el.getAttribute('data-turn-id') ||
+        el.getAttribute('data-canonical-dil-message-id') ||
+        el.getAttribute('id') ||
+        '';
+    }
+    message.media.forEach(function (entry, index) {
+      entry.messageId = messageId;
+      entry.ordinal = index;
+    });
+  }
+
+  function mergeMediaBytes(previous, message) {
+    if (!previous || !previous.media || !message) return;
+    if (!message.media) message.media = [];
+    function donorFor(entry, index) {
+      var match = null;
+      previous.media.forEach(function (prev) {
+        if (match || !prev || !prev.base64) return;
+        if (entry.src && prev.src === entry.src) match = prev;
+        else if (!entry.src && prev.kind === entry.kind && prev.ordinal === index) match = prev;
+      });
+      return match;
+    }
+    message.media.forEach(function (entry, index) {
+      if (!entry || entry.base64) return;
+      var donor = donorFor(entry, index);
+      if (!donor) return;
+      entry.base64 = donor.base64;
+      entry.mime = donor.mime;
+    });
+    previous.media.forEach(function (prev) {
+      if (!prev || !prev.id) return;
+      if (!prev.base64 && prev.kind === 'image') return;
+      if (prev.src && adImageSrcs.has(prev.src)) return;
+      var kept = message.media.some(function (entry) {
+        return entry === prev
+          || (prev.base64 && entry.base64 === prev.base64)
+          || (prev.src && entry.src === prev.src)
+          || (!prev.src && entry.kind === prev.kind && entry.ordinal === prev.ordinal);
+      });
+      if (kept) return;
+      message.media.push(prev);
+      if (message.html.indexOf('data-ct-media="' + prev.id + '"') < 0) {
+        message.html += '<img data-ct-media="' + esc(prev.id) + '" alt="">';
+      }
+    });
+  }
+
+  function rememberMessage(map, key, message) {
+    var previous = map.get(key);
+    if (previous && previous !== message) mergeMediaBytes(previous, message);
+    if (!previous) {
+      map.set(key, message);
+      return;
+    }
+    var prevLen = plainText(previous.html).length;
+    var nextLen = plainText(message.html).length;
+    var prevCount = previous.media ? previous.media.length : 0;
+    var nextCount = message.media ? message.media.length : 0;
+    if (nextLen > prevLen || (nextLen === prevLen && nextCount >= prevCount)) map.set(key, message);
+  }
+
+  function findMessageElement(messageId) {
+    var id = String(messageId || '').replace(/"/g, '');
+    if (!id) return null;
+    var sel = '[data-message-id="' + id + '"], [data-turn-id="' + id + '"], [data-canonical-dil-message-id="' + id + '"]';
+    var found = queryAllDeep(document, sel);
+    if (found.length) return found[0];
+    var byId = document.getElementById(id);
+    return byId || null;
+  }
+
+  function visualCandidates(root) {
+    if (!root) return [];
+    return queryAllDeep(root, 'img, canvas, iframe, [role="img"]').filter(function (node) {
+      if (!node || captureClaimed.has(node)) return false;
+      if (isTinyVisual(node)) return false;
+      if (node.closest && node.closest('[data-message-actions], [data-assistant-message-actions]')) return false;
+      return true;
+    });
+  }
+
+  function boxOk(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    var rect = el.getBoundingClientRect();
+    return rect.width >= 8 && rect.height >= 8;
+  }
+
+  async function waitForImage(img) {
+    if (!img || img.tagName !== 'IMG') return;
+    if (img.complete && img.naturalWidth) return;
+    await new Promise(function (resolve) {
+      var done = function () {
+        img.removeEventListener('load', done);
+        img.removeEventListener('error', done);
+        resolve();
+      };
+      img.addEventListener('load', done);
+      img.addEventListener('error', done);
+      setTimeout(done, 1200);
+    });
+  }
+
+  function canvasPayload(el) {
+    try {
+      var canvas = el.tagName === 'CANVAS' ? el : document.createElement('canvas');
+      if (el.tagName === 'IMG') {
+        var w = el.naturalWidth || el.width || 0;
+        var h = el.naturalHeight || el.height || 0;
+        if (w < 2 || h < 2) return null;
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d').drawImage(el, 0, 0);
+      }
+      var data = canvas.toDataURL('image/png');
+      var comma = data.indexOf(',');
+      if (comma < 0) return null;
+      return { ok: true, mime: 'image/png', base64: data.slice(comma + 1) };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function bytesFromElement(entry, el) {
+    if (!entry || !el) return null;
+    if (entry.kind === 'image' || el.tagName === 'IMG') {
+      await waitForImage(el);
+      var src = (el.tagName === 'IMG' ? imageSrc(el) : '') || entry.src || '';
+      if (src) {
+        var fetched = await fetchImagePayload(src);
+        if (fetched && fetched.ok && fetched.base64) return fetched;
+      }
+      if (el.tagName === 'IMG') return canvasPayload(el);
+      return null;
+    }
+    if (el.tagName === 'CANVAS') return canvasPayload(el);
+    return null;
+  }
+
+  async function snapshotMediaBytes() {
+    var ids = [];
+    mediaMeta.forEach(function (_entry, id) { ids.push(id); });
+    for (var i = 0; i < ids.length; i++) {
+      var entry = mediaMeta.get(ids[i]);
+      if (!entry || entry.base64) continue;
+      var el = mediaElements.get(entry.id);
+      if (!el || !el.isConnected) continue;
+      var payload = await bytesFromElement(entry, el);
+      if (!payload || !payload.ok || !payload.base64) continue;
+      entry.base64 = payload.base64;
+      entry.mime = payload.mime || 'image/png';
+    }
+  }
+
+  async function visibleCaptureRects() {
+    restoreHidden();
+    dismissObstructions();
+    var rects = [];
+    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    var hidden = 0;
+    var candidates = [];
+    mediaMeta.forEach(function (entry, id) {
+      if (!entry || entry.base64) return;
+      var el = mediaElements.get(id);
+      if (!el || !el.isConnected || !el.getBoundingClientRect) return;
+      var box = el.getBoundingClientRect();
+      if (box.bottom < 0 || box.top > vh || box.right < 0 || box.left > vw) return;
+      candidates.push({ id: id, el: el });
+      hidden += clearOverlaysFor(el);
+    });
+    if (hidden) await delay(90);
+    candidates.forEach(function (item) {
+      var id = item.id;
+      var el = item.el;
+      if (coveredByOverlay(el)) {
+        logOverlay('skip-capture', el, { mediaId: id });
+        return;
+      }
+      var rect = el.getBoundingClientRect();
+      var left = Math.max(rect.left, 0);
+      var top = Math.max(rect.top, 0);
+      var right = Math.min(rect.right, vw);
+      var bottom = Math.min(rect.bottom, vh);
+      var width = Math.floor(right - left);
+      var height = Math.floor(bottom - top);
+      if (width < 48 || height < 48) return;
+      rects.push({ id: id, x: Math.floor(left), y: Math.floor(top), width: width, height: height });
+    });
+    return rects;
+  }
+
+  window.__ctStoreMediaPng = function (id, base64) {
+    var entry = mediaMeta.get(String(id || ''));
+    if (!entry || !base64) return false;
+    if (entry.base64) return true;
+    entry.base64 = String(base64);
+    entry.mime = 'image/png';
+    return true;
+  };
+
+  // スクロール1段ごとにホストへ画面上の矩形を返し、CORS 画像や地図 iframe を capturePage する。
+  function createSaveDrive(api) {
+    var drive = null;
+    return {
+      begin: function () {
+        api.reset();
+        var seed = api.seed();
+        var sc = findScroller(document, seed);
+        var prev = sc ? sc.scrollTop : 0;
+        if (sc) sc.scrollTop = 0;
+        drive = { sc: sc, prev: prev, stuck: 0, steps: 0, started: false, epoch: window.__ctEpoch };
+        return true;
+      },
+      step: async function () {
+        if (!drive || drive.epoch !== window.__ctEpoch) return { done: true, rects: [] };
+        if (!drive.started) {
+          await delay(160);
+          if (!drive || drive.epoch !== window.__ctEpoch) return { done: true, rects: [] };
+          if (api.warmCitations) await api.warmCitations();
+          api.harvest();
+          await snapshotMediaBytes();
+          drive.started = true;
+          return { done: !drive.sc, rects: await visibleCaptureRects() };
+        }
+        var sc = drive.sc;
+        if (!sc) return { done: true, rects: await visibleCaptureRects() };
+        drive.steps += 1;
+        var before = sc.scrollTop;
+        sc.scrollTop = before + Math.max(240, Math.floor(sc.clientHeight * 0.7));
+        await delay(160);
+        if (!drive || drive.epoch !== window.__ctEpoch) return { done: true, rects: [] };
+        if (api.warmCitations) await api.warmCitations();
+        api.harvest();
+        await snapshotMediaBytes();
+        var atEnd = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 4;
+        var done = false;
+        if (sc.scrollTop === before) {
+          if (atEnd || ++drive.stuck >= 3) done = true;
+        } else {
+          drive.stuck = 0;
+        }
+        if (atEnd || drive.steps >= 60) done = true;
+        return { done: done, rects: await visibleCaptureRects() };
+      },
+      finish: async function () {
+        var current = drive;
+        drive = null;
+        restoreHidden();
+        if (current && current.sc) current.sc.scrollTop = current.prev;
+        api.stopScanning();
+        return api.exportPayload();
+      },
+    };
+  }
+
+  async function locateMediaElement(id) {
+    var key = String(id || '');
+    var entry = mediaMeta.get(key);
+    var el = mediaElements.get(key);
+    if (el && el.isConnected && boxOk(el)) return el;
+    var root = entry ? findMessageElement(entry.messageId) : null;
+    var scroller = findScroller(document, root || document.querySelector('main'));
+    var start = scroller ? scroller.scrollTop : 0;
+    if (!root && scroller && entry && entry.messageId) {
+      scroller.scrollTop = 0;
+      await delay(120);
+      for (var i = 0; i < 40; i++) {
+        root = findMessageElement(entry.messageId);
+        if (root) break;
+        var before = scroller.scrollTop;
+        scroller.scrollTop = before + Math.max(240, Math.floor(scroller.clientHeight * 0.7));
+        await delay(90);
+        if (scroller.scrollTop === before) break;
+      }
+    }
+    if (!root) {
+      if (scroller) scroller.scrollTop = start;
+      return el && el.isConnected ? el : null;
+    }
+    try { root.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
+    await delay(350);
+    el = mediaElements.get(key);
+    if (el && el.isConnected && boxOk(el)) return el;
+    var candidates = visualCandidates(root);
+    var ordinal = entry && typeof entry.ordinal === 'number' ? entry.ordinal : 0;
+    return candidates[ordinal] || candidates[0] || null;
+  }
+
+  window.__ctMaterializeMedia = async function (id) {
+    var entry = mediaMeta.get(String(id || ''));
+    if (entry && entry.base64) return { ok: true, mime: entry.mime || 'image/png', base64: entry.base64 };
+    var el = await locateMediaElement(id);
+    if (!el) return { ok: false, error: 'missing element' };
+    var payload = await bytesFromElement(entry || { kind: el.tagName === 'IMG' ? 'image' : 'capture', src: '' }, el);
+    if (payload && payload.ok && payload.base64) {
+      if (entry) {
+        entry.base64 = payload.base64;
+        entry.mime = payload.mime || 'image/png';
+      }
+      return payload;
+    }
+    return { ok: false, error: 'no bytes' };
+  };
+
+  window.__ctFocusMedia = async function (id) {
+    restoreHidden();
+    dismissObstructions();
+    var el = await locateMediaElement(id);
+    if (!el || !el.getBoundingClientRect) return null;
+    try {
+      el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+    } catch (e) {
+      try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e2) {}
+    }
+    await delay(350);
+    var rect = el.getBoundingClientRect();
+    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    var minTop = 96;
+    var targetTop = Math.max(minTop, Math.floor((vh - rect.height) / 2));
+    if (Math.abs(rect.top - targetTop) > 8) {
+      var scroller = findScroller(document, el);
+      if (scroller) {
+        scroller.scrollTop += Math.floor(rect.top - targetTop);
+        await delay(220);
+        rect = el.getBoundingClientRect();
+      }
+    }
+    dismissObstructions();
+    if (clearOverlaysFor(el)) await delay(90);
+    if (coveredByOverlay(el)) {
+      logOverlay('skip-focus', el, { mediaId: String(id || '') });
+      restoreHidden();
+      return null;
+    }
+    rect = el.getBoundingClientRect();
+    var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    var x = Math.max(0, Math.floor(rect.left));
+    var y = Math.max(0, Math.floor(rect.top));
+    var right = Math.min(vw, Math.ceil(rect.right));
+    var bottom = Math.min(vh, Math.ceil(rect.bottom));
+    var width = Math.max(0, right - x);
+    var height = Math.max(0, bottom - y);
+    if (width < 8 || height < 8) return null;
+    return { x: x, y: y, width: width, height: height };
+  };
+
+  // --- Site installers: observe the conversation and export via __ctCollect ---
+
+  function installChatGPT() {
+    var specific = '[data-message-author-role], [data-message-role="user"], [data-message-role="assistant"], [data-turn="user"], [data-turn="assistant"]';
+    var fallback = '[data-testid*="conversation-turn"], [class*="agent-turn"], [class*="conversation-turn"]';
+    var collected = new Map();
+    var session = nextSession();
+    var conv = convId();
+    var fullScanned = !conv;
+    var scanning = false;
+    var scanToken = 0;
+
+    function convId() {
+      var path = location.pathname || '';
+      var chat = /\/(?:c|uc)\/([^/]+)/.exec(path);
+      if (chat) return chat[1];
+      var share = /\/share\/([^/]+)/.exec(path);
+      if (share) return 'share:' + share[1];
+      return '';
+    }
+
+    function roleOf(el) {
+      function raw(node) {
+        if (!node || !node.getAttribute) return '';
+        return (node.getAttribute('data-message-author-role') || node.getAttribute('data-message-role') || node.getAttribute('data-turn') || node.getAttribute('data-author') || '').toLowerCase();
+      }
+      var role = raw(el);
+      if (!role) {
+        var inner = el.querySelector('[data-message-author-role], [data-message-role], [data-turn]');
+        role = raw(inner);
+      }
+      if (role.indexOf('user') >= 0) return 'user';
+      if (role.indexOf('assistant') >= 0) return 'assistant';
+      var className = typeof el.className === 'string' ? el.className : '';
+      var blob = ((el.getAttribute('data-testid') || '') + ' ' + className).toLowerCase();
+      if (blob.indexOf('user') >= 0 && blob.indexOf('assistant') < 0) return 'user';
+      return 'assistant';
+    }
+
+    function add(el) {
+      var message = buildMessage(el, roleOf(el));
+      if (!message) return;
+      stampMedia(message, el);
+      var id = el.getAttribute('data-message-id') || el.getAttribute('data-turn-id') || el.getAttribute('data-canonical-dil-message-id');
+      var key = id || (message.role + '\n' + plainText(message.html));
+      rememberMessage(collected, key, message);
+    }
+
+    function harvest(selector) {
+      var docs = allDocs();
+      docs.forEach(function (doc) {
+        outermost(queryAllDeep(doc, selector)).forEach(add);
+      });
+    }
+
+    async function fullScan() {
+      if (fullScanned || !convId()) return;
+      var token = ++scanToken;
+      var scanSession = session;
+      fullScanned = true;
+      scanning = true;
+      var sc = null;
+      var prev = 0;
+      try {
+        var seed = queryAllDeep(document, specific)[0] || document.querySelector('main');
+        sc = findScroller(document, seed);
+        prev = sc ? sc.scrollTop : 0;
+        collected.clear();
+        resetMedia();
+        if (sc) {
+          sc.scrollTop = 0;
+          await delay(150);
+          if (session !== scanSession || window.__ctEpoch !== epoch) return;
+          harvest(specific);
+          await snapshotMediaBytes();
+          var stuck = 0;
+          for (var i = 0; i < 60; i++) {
+            if (session !== scanSession || window.__ctEpoch !== epoch) return;
+            var before = sc.scrollTop;
+            var step = Math.max(240, Math.floor(sc.clientHeight * 0.7));
+            sc.scrollTop = before + step;
+            await delay(100);
+            harvest(specific);
+            await snapshotMediaBytes();
+            var atEnd = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 4;
+            if (sc.scrollTop === before) {
+              if (atEnd || ++stuck >= 3) break;
+            } else {
+              stuck = 0;
+            }
+            if (atEnd) break;
+          }
+        } else {
+          harvest(specific);
+          await snapshotMediaBytes();
+        }
+        if (!collected.size && session === scanSession) harvest(fallback);
+        await snapshotMediaBytes();
+      } catch (e) {
+      } finally {
+        if (session === scanSession && sc) sc.scrollTop = prev;
+        if (scanToken === token) scanning = false;
+      }
+    }
+
+    function beginConversation() {
+      session = nextSession();
+      collected.clear();
+      resetMedia();
+      fullScanned = false;
+      scanning = false;
+      scanToken += 1;
+      if (conv) void fullScan();
+      else fullScanned = true;
+    }
+
+    function noteNavigation() {
+      var next = convId();
+      if (next === conv) return;
+      var prev = conv;
+      var had = collected.size;
+      conv = next;
+      if (!prev && next && had > 0) {
+        collected.clear();
+        resetMedia();
+        harvest(specific);
+        fullScanned = true;
+        return;
+      }
+      beginConversation();
+    }
+
+    function plainFallback() {
+      if (collected.size) return;
+      var main = document.querySelector('main') || document.body;
+      var text = main ? (main.innerText || '').replace(/\u00a0/g, ' ').trim() : '';
+      if (text.length < 20) return;
+      collected.set('fallback-main', { role: '', html: '<p>' + esc(text) + '</p>', media: [] });
+    }
+
+    function snapshot() {
+      var items = [];
+      collected.forEach(function (item) {
+        items.push({ role: item.role, html: item.html, media: item.media || [] });
+      });
+      return {
+        session: session,
+        url: location.href,
+        title: document.title || 'ChatGPT',
+        streaming: isStreaming(),
+        scanning: scanning,
+        items: items
+      };
+    }
+
+    window.__ctReset = function () {
+      conv = '';
+      session = nextSession();
+      collected.clear();
+      resetMedia();
+      fullScanned = true;
+      scanning = false;
+      scanToken += 1;
+    };
+
+    window.__ctExport = function () {
+      noteNavigation();
+      if (!scanning && !collected.size) harvest(specific);
+      if (!scanning && !collected.size) harvest(fallback);
+      return snapshot();
+    };
+
+    async function exportForSave() {
+      if (!collected.size) harvest(specific);
+      if (!collected.size) harvest(fallback);
+      if (!collected.size) plainFallback();
+      var exported = snapshot();
+      exported.streaming = false;
+      exported.scanning = false;
+      exported.sources = await collectSourcesForSave(collected);
+      var debug = buildPageDebugPayload(exported);
+      if (debug) exported.debug = debug;
+      return exported;
+    }
+
+    var saveDrive = createSaveDrive({
+      reset: function () {
+        noteNavigation();
+        resetDebugCitations();
+        session = nextSession();
+        collected.clear();
+        resetMedia();
+        scanToken += 1;
+        fullScanned = true;
+        scanning = true;
+      },
+      seed: function () {
+        return queryAllDeep(document, specific)[0] || document.querySelector('main');
+      },
+      harvest: function () { harvest(specific); },
+      warmCitations: warmCitationPopovers,
+      stopScanning: function () { scanning = false; },
+      exportPayload: exportForSave,
+    });
+    window.__ctBeginSave = function () { return saveDrive.begin(); };
+    window.__ctSaveStep = function () { return saveDrive.step(); };
+    window.__ctFinishSave = function () { return saveDrive.finish(); };
+
+    window.__ctSave = async function () {
+      noteNavigation();
+      resetDebugCitations();
+      collected.clear();
+      resetMedia();
+      scanToken += 1;
+      scanning = false;
+      fullScanned = false;
+      if (convId()) await fullScan();
+      return exportForSave();
+    };
+
+    window.__ctNoteNavigation = noteNavigation;
+    if (!window.__ctHistoryPatched) {
+      window.__ctHistoryPatched = true;
+      var pushState = history.pushState;
+      var replaceState = history.replaceState;
+      history.pushState = function () {
+        var result = pushState.apply(this, arguments);
+        if (window.__ctNoteNavigation) window.__ctNoteNavigation();
+        return result;
+      };
+      history.replaceState = function () {
+        var result = replaceState.apply(this, arguments);
+        if (window.__ctNoteNavigation) window.__ctNoteNavigation();
+        return result;
+      };
+      window.addEventListener('popstate', function () {
+        if (window.__ctNoteNavigation) window.__ctNoteNavigation();
+      });
+    }
+    var harvestTimer = 0;
+    var observer = new MutationObserver(function () {
+      if (window.__ctEpoch !== epoch) return;
+      noteNavigation();
+      if (scanning || harvestTimer) return;
+      harvestTimer = window.setTimeout(function () {
+        harvestTimer = 0;
+        if (!scanning && window.__ctEpoch === epoch) harvest(specific);
+      }, 200);
+    });
+    observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+    var navTimer = window.setInterval(function () {
+      if (window.__ctEpoch === epoch) noteNavigation();
+    }, 400);
+    disposers.push(function () {
+      observer.disconnect();
+      window.clearInterval(navTimer);
+      window.clearTimeout(harvestTimer);
+    });
+
+    if (!window.__ctSaving) {
+      if (conv) void fullScan();
+      else harvest(specific);
+    }
+  }
+
+  installChatGPT();
+  return 0;
+})();

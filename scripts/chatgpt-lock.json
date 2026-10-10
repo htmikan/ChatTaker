@@ -1,0 +1,11 @@
+{
+  "sha256": "25163b91bffa5a0f66f78b7a070243cd7c2cf2fb74b85cec0d8621fe55ea46c1",
+  "files": [
+    "footnotes.ts",
+    "index.ts",
+    "labels.ts",
+    "markdown.ts",
+    "page.txt",
+    "places.ts"
+  ]
+}
