@@ -2,8 +2,7 @@
  * Plugin settings model and the Obsidian settings tab UI
  * (save folder, filename template, language, citation debug).
  *
- * Obsidian 1.13+ uses getSettingDefinitions() for settings search;
- * display() remains as a fallback for older app versions.
+ * Settings are declared with getSettingDefinitions() (Obsidian 1.13+).
  */
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type ChatTakerPlugin from "./main";
@@ -92,62 +91,5 @@ export class ChatTakerSettingTab extends PluginSettingTab {
         },
       },
     ];
-  }
-
-  /** Fallback for Obsidian < 1.13.0 (imperative settings UI). */
-  display(): void {
-    const { containerEl } = this;
-    containerEl.empty();
-
-    new Setting(containerEl)
-      .setName(t("settings.language.name"))
-      .setDesc(t("settings.language.desc"))
-      .addDropdown((dropdown) => {
-        for (const option of languageOptions()) dropdown.addOption(option.id, option.label);
-        dropdown.setValue(this.plugin.settings.language);
-        dropdown.onChange(async (value) => {
-          this.plugin.settings.language = asUiLanguage(value);
-          setLanguage(this.plugin.settings.language);
-          await this.plugin.saveSettings();
-          this.plugin.applyLanguage();
-          this.display();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName(t("settings.folder.name"))
-      .setDesc(t("settings.folder.desc"))
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.folder)
-          .setValue(this.plugin.settings.folder)
-          .onChange(async (value) => {
-            this.plugin.settings.folder = value.trim() || DEFAULT_SETTINGS.folder;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName(t("settings.filename.name"))
-      .setDesc(t("settings.filename.desc"))
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.filenameTemplate)
-          .setValue(this.plugin.settings.filenameTemplate)
-          .onChange(async (value) => {
-            this.plugin.settings.filenameTemplate = value.trim() || DEFAULT_SETTINGS.filenameTemplate;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName(t("settings.debug.name"))
-      .setDesc(t("settings.debug.desc"))
-      .addToggle((toggle) =>
-        toggle.setValue(Boolean(this.plugin.settings.debugCitations)).onChange(async (value) => {
-          this.plugin.settings.debugCitations = value;
-          await this.plugin.saveSettings();
-        }),
-      );
   }
 }

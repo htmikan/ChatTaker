@@ -21,15 +21,15 @@ export interface SiteModule {
   /** Raw JS source injected into the site's webview (the page script). */
   collectScript: string;
   /** Build the final Markdown note, or null when there is nothing to save. */
-  buildNote(input: NoteInput): string | null;
+  buildNote(this: void, input: NoteInput): string | null;
   /** Sanitized HTML → Markdown (Turndown pipeline). */
-  htmlToMarkdown(html: string): string;
+  htmlToMarkdown(this: void, html: string): string;
   /** Drop chrome-only messages and merge duplicates. */
-  prepareMessages(messages: CollectedMessage[]): CollectedMessage[];
+  prepareMessages(this: void, messages: CollectedMessage[]): CollectedMessage[];
   /** Merge page-collected sources with URLs discovered in message HTML. */
-  collectSources(base: CollectedSource[], messages: CollectedMessage[]): CollectedSource[];
+  collectSources(this: void, base: CollectedSource[], messages: CollectedMessage[]): CollectedSource[];
   /** Replace source links with footnote markers for printable HTML. */
-  replaceSourceLinksInHtml(html: string, sources: CollectedSource[]): string;
+  replaceSourceLinksInHtml(this: void, html: string, sources: CollectedSource[]): string;
   /** Expand data-ct-math spans for printable HTML. */
-  expandMathInHtml(html: string): string;
+  expandMathInHtml(this: void, html: string): string;
 }
