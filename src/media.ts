@@ -159,8 +159,34 @@ async function saveMapHtmlIfPossible(
 }
 
 async function loadMediaBinary(webview: MediaWebview, media: CollectedMedia): Promise<MediaBinary | null> {
-  if (media.kind === "capture" || media.kind === "map") return captureMedia(webview, media.id);
+  const inline = binaryFromBase64(media.base64, media.mime);
+  if (inline) return inline;
+  const materialized = await materializeMedia(webview, media.id);
+  if (materialized) return materialized;
+  if (media.kind === "capture" || media.kind === "map" || media.kind === "image") {
+    const shot = await captureMedia(webview, media.id);
+    if (shot) return shot;
+  }
   return fetchMedia(webview, media);
+}
+
+function binaryFromBase64(base64: string | undefined, mime: string | undefined): MediaBinary | null {
+  if (!base64) return null;
+  const data = base64ToArrayBuffer(base64);
+  if (!data.byteLength) return null;
+  const type = mime || "image/png";
+  return { data, ext: extensionForMime(type), mime: type };
+}
+
+/** Ask the page to re-scroll a virtualized message and read pixels while the node is connected. */
+async function materializeMedia(webview: MediaWebview, id: string): Promise<MediaBinary | null> {
+  const raw = await webview.executeJavaScript(
+    `window.__ctMaterializeMedia ? window.__ctMaterializeMedia(${JSON.stringify(id)}) : null`,
+    true,
+  );
+  const result = asFetchResult(raw);
+  if (!result?.ok || !result.base64) return null;
+  return binaryFromBase64(result.base64, result.mime);
 }
 
 async function fetchMedia(webview: MediaWebview, media: CollectedMedia): Promise<MediaBinary | null> {
@@ -244,6 +270,92 @@ function arrayBufferToDataUrl(data: ArrayBuffer, mime: string): string {
     parts.push(String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk))));
   }
   return `data:${mime};base64,${btoa(parts.join(""))}`;
+}
+
+interface ScanRect extends CaptureRect {
+  id: string;
+}
+
+/**
+ * Scroll the conversation one step at a time and screenshot media that the page
+ * cannot read (cross-origin images, map iframes) while those nodes are on screen.
+ */
+export async function collectChatWithCaptures(
+  webview: MediaWebview,
+  script: string,
+  debugCitations: boolean,
+): Promise<unknown> {
+  await webview.executeJavaScript(
+    `window.__ctSaving = true; window.__ctDebugCitations = ${debugCitations ? "true" : "false"};`,
+    true,
+  );
+  try {
+    await webview.executeJavaScript(script, true);
+    const stepped = await webview.executeJavaScript(`typeof window.__ctBeginSave === "function"`, true);
+    if (stepped !== true) {
+      return webview.executeJavaScript(
+        "window.__ctSave ? window.__ctSave() : (window.__ctExport ? window.__ctExport() : null)",
+        true,
+      );
+    }
+    await webview.executeJavaScript(`window.__ctBeginSave()`, true);
+    for (let i = 0; i < 80; i++) {
+      const step = asScanStep(await webview.executeJavaScript(`window.__ctSaveStep()`, true));
+      await storeCapturedRects(webview, step.rects);
+      if (step.done) break;
+    }
+    return webview.executeJavaScript(`window.__ctFinishSave()`, true);
+  } finally {
+    try {
+      await webview.executeJavaScript(`window.__ctSaving = false;`, true);
+    } catch {
+      // Webview can close before the flag reset.
+    }
+  }
+}
+
+async function storeCapturedRects(webview: MediaWebview, rects: ScanRect[]): Promise<void> {
+  for (const rect of rects) {
+    try {
+      const image = await webview.capturePage({ x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+      if (!image || image.isEmpty()) continue;
+      const data = toArrayBuffer(image.toPNG());
+      if (!data.byteLength) continue;
+      const base64 = bytesToBase64(data);
+      await webview.executeJavaScript(
+        `window.__ctStoreMediaPng && window.__ctStoreMediaPng(${JSON.stringify(rect.id)}, ${JSON.stringify(base64)})`,
+        true,
+      );
+    } catch (error) {
+      console.error("ChatTaker: live capture failed", rect.id, error);
+    }
+  }
+}
+
+function asScanStep(value: unknown): { done: boolean; rects: ScanRect[] } {
+  if (!value || typeof value !== "object") return { done: true, rects: [] };
+  const record = value as { done?: unknown; rects?: unknown };
+  const rects: ScanRect[] = [];
+  if (Array.isArray(record.rects)) {
+    for (const item of record.rects) {
+      const rect = asRect(item);
+      if (!rect || !item || typeof item !== "object") continue;
+      const id = (item as { id?: unknown }).id;
+      if (typeof id !== "string" || !id) continue;
+      rects.push({ id, ...rect });
+    }
+  }
+  return { done: Boolean(record.done), rects };
+}
+
+function bytesToBase64(data: ArrayBuffer): string {
+  const bytes = new Uint8Array(data);
+  const chunk = 0x8000;
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i += chunk) {
+    parts.push(String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk))));
+  }
+  return btoa(parts.join(""));
 }
 
 function toArrayBuffer(value: Uint8Array | ArrayBuffer): ArrayBuffer {

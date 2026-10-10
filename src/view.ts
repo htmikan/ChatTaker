@@ -18,7 +18,7 @@ import {
   type ChatSite,
 } from "./filename";
 import { buildNote } from "./markdown";
-import { loadCollectedMediaData, saveCollectedMedia, type CaptureRect, type MediaWebview } from "./media";
+import { collectChatWithCaptures, loadCollectedMediaData, saveCollectedMedia, type CaptureRect, type MediaWebview } from "./media";
 import { buildPrintHtml, saveChatPdfFromHtml } from "./pdf";
 import { asSaveFormat, DEFAULT_SETTINGS, type SaveFormat } from "./settings";
 import { buildCitationDebugDump, writeCitationDebugDump } from "./debug";
@@ -381,15 +381,7 @@ export class ChatTakerView extends ItemView {
   private async collectForSave(): Promise<CollectedChat | null> {
     const webview = this.webview;
     if (!webview) return null;
-    await webview.executeJavaScript(
-      `window.__ctDebugCitations = ${this.plugin.settings.debugCitations ? "true" : "false"};`,
-      true,
-    );
-    await webview.executeJavaScript(collectScript, true);
-    const raw = await webview.executeJavaScript(
-      "window.__ctSave ? window.__ctSave() : (window.__ctExport ? window.__ctExport() : null)",
-      true,
-    );
+    const raw = await collectChatWithCaptures(webview, collectScript, this.plugin.settings.debugCitations);
     return asCollectedChat(raw);
   }
 

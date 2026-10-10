@@ -128,9 +128,25 @@ function escapeHtmlText(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/**
+ * ChatGPT の表セルは div / p 入りで、Turndown がセル内改行にして表を壊す。
+ * リンク以外のブロックを1行に畳む。
+ */
+function flattenTableCells(html: string): string {
+  return html.replace(/<(td|th)(\s[^>]*)?>([\s\S]*?)<\/\1>/gi, (_all, tag: string, attrs: string | undefined, inner: string) => {
+    const flat = inner
+      .replace(/<br\s*\/?>/gi, " ")
+      .replace(/<\/(?!a\b)[^>]+>/gi, " ")
+      .replace(/<(?!a\b|\/a\b)[^>]+>/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return `<${tag}${attrs || ""}>${flat}</${tag}>`;
+  });
+}
+
 /** Run Turndown (+ GFM / ChatTaker rules) on sanitized message HTML. */
 export function htmlToMarkdown(html: string): string {
-  return turndown.turndown(stripResponseLabelsHtml(html)).replace(/\u00a0/g, " ").trim();
+  return turndown.turndown(flattenTableCells(stripResponseLabelsHtml(html))).replace(/\u00a0/g, " ").trim();
 }
 
 /** Drop chrome-only messages and strip repeated UI labels from HTML. */

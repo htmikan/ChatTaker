@@ -240,6 +240,21 @@ assert.equal(note.includes("## ChatGPT"), false);
 assert.match(note, /```ts\nconst a = 1;\n```/);
 assert.match(note, /\| A \|/);
 assert.match(note, /\| B \|/);
+
+const brokenTable = buildNote({
+  conversationId: "table1",
+  source: "https://chatgpt.com/c/table1",
+  messages: [
+    {
+      role: "assistant",
+      html: "<table><thead><tr><th><p>項目</p></th><th><div>目安</div></th></tr></thead><tbody><tr><td><p>片道の所要時間</p></td><td>約2時間30分</td></tr></tbody></table>",
+    },
+  ],
+});
+assert.ok(brokenTable);
+assert.match(brokenTable, /\| 項目 \| 目安 \|/);
+assert.match(brokenTable, /\| 片道の所要時間 \| 約2時間30分 \|/);
+assert.equal(brokenTable.includes("\n項目\n"), false);
 assert.equal(buildNote({ conversationId: "", source: "https://chatgpt.com/", messages: [] }), null);
 
 const geminiNote = buildNote({
@@ -471,6 +486,9 @@ assert.match(collectScript, /FAKE_DOMAIN_EXTS/);
 assert.match(collectScript, /isCodeLikeNode/);
 assert.match(collectScript, /isUrlCardReference/);
 assert.match(collectScript, /data-ct-keep-link/);
+assert.match(collectScript, /warmCitationPopovers/);
+assert.match(collectScript, /__ctBeginSave/);
+assert.match(collectScript, /__ctStoreMediaPng/);
 assert.match(collectScript, /mapsSearchUrl/);
 assert.match(collectScript, /isPlaceCardRoot/);
 assert.equal(

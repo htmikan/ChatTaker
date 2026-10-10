@@ -21,6 +21,11 @@ export interface CollectedMedia {
   src?: string;
   sourceUrl?: string;
   mapState?: MapState;
+  /** Populated while the element is still on screen (blob URLs die after virtualized scroll). */
+  base64?: string;
+  mime?: string;
+  messageId?: string;
+  ordinal?: number;
 }
 
 export interface CollectedSource {
@@ -69,6 +74,13 @@ export interface CitationDebugDump {
     definitionCount: number;
     definitions: string[];
   };
+  media?: Array<{
+    id: string;
+    kind: string;
+    src?: string;
+    hasBytes: boolean;
+    ordinal?: number;
+  }>;
 }
 
 export interface CollectedMessage {
@@ -138,6 +150,10 @@ function asMediaList(value: unknown): CollectedMedia[] {
       sourceUrl:
         typeof record.sourceUrl === "string" && record.sourceUrl.trim() ? record.sourceUrl.trim() : undefined,
       mapState: asMapState(record.mapState),
+      base64: typeof record.base64 === "string" && record.base64 ? record.base64 : undefined,
+      mime: typeof record.mime === "string" && record.mime ? record.mime : undefined,
+      messageId: typeof record.messageId === "string" && record.messageId ? record.messageId : undefined,
+      ordinal: typeof record.ordinal === "number" && Number.isFinite(record.ordinal) ? record.ordinal : undefined,
     });
   }
   return media;

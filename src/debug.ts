@@ -53,6 +53,15 @@ export function buildCitationDebugDump(input: {
     sources,
     citations,
     messages,
+    media: input.data.items.flatMap((item) =>
+      (item.media ?? []).map((entry) => ({
+        id: entry.id,
+        kind: entry.kind,
+        src: entry.src ? entry.src.slice(0, 180) : undefined,
+        hasBytes: Boolean(entry.base64),
+        ordinal: entry.ordinal,
+      })),
+    ),
     footnotes: {
       markerCount: footnoteMarkers,
       definitionCount: footnoteDefs,
